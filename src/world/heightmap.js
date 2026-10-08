@@ -1,9 +1,20 @@
 import { mulberry32, makeFbm2D } from '../core/noise.js';
 
+// Дистанция до ровного коридора: 0 внутри прямоугольника, дальше — расстояние до него.
+// Весь рельеф строится по этой величине: в коридоре плоско (город, лагерь, дорога),
+// наружу — сначала холмы долины, затем хребет гор по краям карты.
+export function corridorDistance(cfg, x, z) {
+  return Math.hypot(
+    Math.max(0, Math.abs(x) - cfg.corridorHalfW),
+    Math.max(0, Math.abs(z) - cfg.corridorHalfL),
+  );
+}
+
 // Аналитическая функция рельефа: высота(x, z) строится шумом, а не хранится в массиве.
 // Плюсы: физика может сэмплить землю в любой точке O(1), без рейкастов по мешу.
 export function createHeightmap(cfg) {
-  // cfg: { seed, size, flatRadius, mountainStart, mountainHeight, hillHeight }
+  // cfg: { seed, corridorHalfW, corridorHalfL, hillStart, hillRange,
+  //        mountainStart, mountainRange, mountainHeight, hillHeight }
   const rng = mulberry32(cfg.seed >>> 0);
   const fbmHills = makeFbm2D(rng, 4, 2, 0.5);
   const fbmRidge = makeFbm2D(rng, 3, 2.1, 0.55);
@@ -14,17 +25,15 @@ export function createHeightmap(cfg) {
     return t * t * (3 - 2 * t);
   };
 
-  const ringEnd = cfg.mountainStart + (cfg.size * 0.5 - cfg.mountainStart) * 0.85;
-
   function heightAt(x, z) {
-    const r = Math.hypot(x, z);
+    const r = corridorDistance(cfg, x, z);
 
-    // долина: мелкие холмы, полностью выглаженные у спавна
-    const valleyK = smoothstep(16, cfg.flatRadius, r);
+    // коридор: идеально ровный; холмы долины раскатываются уже за его краем
+    const valleyK = smoothstep(cfg.hillStart, cfg.hillStart + cfg.hillRange, r);
     let h = (fbmHills(x * 0.012, z * 0.012) * 2 - 1) * cfg.hillHeight * valleyK;
 
-    // кольцо гор по краям: ridged-шум даёт хребты, детальный шум — каменную крошку
-    const mK = smoothstep(cfg.mountainStart, ringEnd, r);
+    // хребет гор по краям карты: ridged-шум даёт хребты, детальный — каменную крошку
+    const mK = smoothstep(cfg.mountainStart, cfg.mountainStart + cfg.mountainRange, r);
     if (mK > 0) {
       const ridge = 1 - Math.abs(fbmRidge(x * 0.015, z * 0.015) * 2 - 1);
       h += Math.pow(mK, 1.4) * (

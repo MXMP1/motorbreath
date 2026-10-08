@@ -11,24 +11,30 @@ const FALL_TIME = 0.45; // сколько NPC заваливается посл�
 export const SHELL = 0.07; // на сколько тёмный контур раздувает тело, м — силуэт читается вдали
 const noop = () => {};
 
-// NPC: три зоны контакта с игроком —
+// NPC: видят строго внутри зелёного конуса зрения (F3): вне его — слепы, за спину
+// можно зайти вплотную, а стены и валуны гасят взгляд, как свет (_los). Плюс три
+// зоны контакта с игроком —
 //   1) близко: агрессия — палка бьёт, пистолет стреляет в упор;
 //   2) средне: сближение; стрелки ищут, за чем спрятаться (стена, валун, ствол),
 //      выбегают на очередь 2–4 выстрела (с разбросом — мажут), отстрелялись —
 //      прячутся за угол и через паузу выбегают снова;
-//   3) вне видимости: реакции нет; если контакт уже был — ищут игрока у последнего
-//      места и широко патрулируют район находки. Выстрел рядом (alertShot):
+//   3) вне видимости: реакции нет; если контакт уже был — идут к последней
+//      известной точке и широко патрулируют район находки. Выстрел рядом (alertShot):
 //      услышавший свист пули и его группа идут искать место выстрела.
 // Живут в городе: патруль крутится вокруг дома. Рисуются одним набором
-// instanced-мешей (тело, голова, палки, пистолеты и тёмные контуры силуэта) —
+// instanced-мешей (тело, голова, лица, палки, пистолеты и тёмные контуры силуэта) —
 // все NPC стоят почти как один.
 export class Npcs {
   constructor(list, cfg, world, covers) {
     this.cfg = cfg.npc;
-    this.world = world; // { heightmap, colliders, size, cityLift }
+    this.world = world; // { heightmap, colliders, sizeX, sizeZ, cityLift }
     this.covers = covers || { grid: new Map(), cell: 8, city: null };
     this.rng = mulberry32(((cfg.seed | 0) ^ 0x5bd1e995) >>> 0);
     this.fullHp = cfg.npc.hp;
+    this._t = 0; // общее время: по нему сканируют взглядом статисты
+    // косинус полуугла конуса зрения: угол из конфига в градусах
+    this._cosHalf = Math.cos((this.cfg.visionAngle * Math.PI) / 360);
+    this._sweepRad = (this.cfg.sweepAngle * Math.PI) / 180;
     this.units = [];
     // баки — живые коллайдеры вне грида укрытий: «щупальце» и патруль должны их видеть
     this.binList = (world.bins && world.bins.units) || null;
@@ -43,11 +49,33 @@ export class Npcs {
     // изнутри, BackSide) — на дистанции NPC не растворяется в пикселях фона
     this.bodyShell = new THREE.InstancedMesh(makeBodyGeometry(SHELL), new THREE.MeshBasicMaterial({ color: cfg.palette.npcOutline, side: THREE.BackSide }), list.length);
     this.headShell = new THREE.InstancedMesh(makeHeadGeometry(SHELL), new THREE.MeshBasicMaterial({ color: cfg.palette.npcOutline, side: THREE.BackSide }), list.length);
-    this.parts = [this.body, this.head, this.sticks, this.guns, this.bodyShell, this.headShell];
+    // «лицо»: тёмная полоса-глаза на передней грани головы. Издалека видно, куда NPC
+    // смотрит — а значит, где у него спина: туда и бей палкой для удара в спину
+    this.faces = new THREE.InstancedMesh(makeFaceGeometry(), new THREE.MeshBasicMaterial({ color: cfg.palette.npcOutline }), list.length);
+    this.parts = [this.body, this.head, this.sticks, this.guns, this.bodyShell, this.headShell, this.faces];
     for (const m of this.parts) {
       m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
       m.frustumCulled = false; // NPC ходят: коробка отсечения меша тут не годится
       m.userData.npc = true;   // хитсякану: попал в NPC — instanceId и есть его номер
+    }
+
+    // отладочная зона зрения (видна вместе с HUD по F3): веер тонких лепестков-лучей,
+    // каждый гаснет о стену или валун, как свет — где веер оборван, там NPC слеп.
+    // В parts веера нет: хитсякан его не видит
+    const cone = (this.cfg.visionAngle * Math.PI) / 180;
+    const slices = this.cfg.visionSlices;
+    this._slice = cone / slices; // угловая ширина одного лепестка, рад
+    const visionMat = new THREE.MeshBasicMaterial({
+      color: cfg.palette.visionFront, transparent: true, opacity: 0.13, depthWrite: false, side: THREE.DoubleSide,
+    });
+    this.debugFront = new THREE.InstancedMesh(makeVisionSlice(this._slice), visionMat, list.length * slices);
+    this.debug = [this.debugFront];
+    this.debugOn = false;
+    for (const m of this.debug) {
+      m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      m.frustumCulled = false;
+      m.renderOrder = 2; // поверх травы, глубину не пишут — мир под ними виден
+      m.visible = false;
     }
 
     this._q = new THREE.Quaternion();
@@ -57,10 +85,14 @@ export class Npcs {
     this._mHand = new THREE.Matrix4();
     this._mRot = new THREE.Matrix4();
     this._mPart = new THREE.Matrix4();
+    this._mHead = new THREE.Matrix4(); // голова отдельно: у статистов она сканирует
     this._c = new THREE.Color();
     this._t1 = new THREE.Vector3(); // разброс выстрела: направление и поперечины
     this._t2 = new THREE.Vector3();
     this._t3 = new THREE.Vector3();
+    this._sSlice = new THREE.Vector3(); // масштаб лепестка отладочного веера зрения
+    this._dbgT = 0;                     // троттлинг веера: пересчёт ~30 Гц, не каждый кадр
+    this._dbgVision = -1;               // прошлая дальность зрения: присед сменил — пересчёт сразу
 
     let wiStick = 0;
     let wiGun = 0;
@@ -73,6 +105,9 @@ export class Npcs {
         yaw: it.rot || 0,
         rot: it.rot || 0,
         home: { x: it.home ? it.home.x : it.x, z: it.home ? it.home.z : it.z },
+        static: !!it.static, // статист: стоит на месте и сканирует головой, пока спокоен
+        gaze: 0,             // текущий поворот головы сверх корпуса (взгляд)
+        gazePhase: i * 2.399963, // фаза сканирования: у всех разная, без rng
         weapon: it.weapon === 'pistol' ? 'pistol' : 'stick',
         wi: 0, // слот внутри своего меша оружия
         hp: this.fullHp,
@@ -128,6 +163,7 @@ export class Npcs {
 
   addTo(scene) {
     for (const m of this.parts) scene.add(m);
+    scene.add(this.debugFront);
   }
 
   groundAt(x, z) {
@@ -135,8 +171,112 @@ export class Npcs {
     return this.world.heightmap.heightAt(x, z) + lift;
   }
 
-  // Удар игрока: толчок, урон и мгновенная осведомлённость — откуда прилетело.
-  hit(i, dir, imp, fromPos) {
+  // Режим отладки (включается вместе с HUD по F3): показать зоны зрения.
+  setDebug(on) {
+    this.debugOn = !!on;
+    this._dbgVision = -1; // включили — веер пересчитается на ближайшем кадре
+    for (const m of this.debug) m.visible = this.debugOn;
+  }
+
+  // Веер зрения (F3): конус нарезан на тонкие лепестки-лучи; каждый гаснет о
+  // стену или валун ровно там, где _los обрывает взгляд. Вне веера NPC слеп.
+  _syncDebug(vision) {
+    const slices = this.cfg.visionSlices;
+    const span = this._slice;
+    const half = (span * slices) / 2; // полуугол полного конуса, рад
+    let idx = 0;
+    for (let i = 0; i < this.units.length; i++) {
+      const u = this.units[i];
+      const yawG = u.yaw + u.gaze; // взгляд: у статистов сканирует влево-вправо
+      this._p.set(u.pos.x, u.pos.y + 0.07, u.pos.z);
+      for (let s = 0; s < slices; s++, idx++) {
+        const a = yawG - half + (s + 0.5) * span; // центр лепестка
+        const r = u.dead ? 0 : this._castVision(u, a, vision);
+        this._q.setFromAxisAngle(UP, a);
+        this._m.compose(this._p, this._q, this._sSlice.set(r, 1, r));
+        this.debugFront.setMatrixAt(idx, this._m);
+      }
+    }
+    this.debugFront.instanceMatrix.needsUpdate = true;
+  }
+
+  // Дальность луча зрения по азимуту a: первое препятствие на пути — там луч гаснет.
+  _castVision(u, a, max) {
+    const dx = Math.sin(a) * max;
+    const dz = Math.cos(a) * max;
+    const x0 = u.pos.x;
+    const z0 = u.pos.z;
+    const stamp = (this._castStamp = (this._castStamp | 0) + 1);
+    let best = 1; // ближайшее препятствие как t отрезка [0..1]
+    const gx0 = Math.floor(Math.min(x0, x0 + dx) / this.covers.cell);
+    const gx1 = Math.floor(Math.max(x0, x0 + dx) / this.covers.cell);
+    const gz0 = Math.floor(Math.min(z0, z0 + dz) / this.covers.cell);
+    const gz1 = Math.floor(Math.max(z0, z0 + dz) / this.covers.cell);
+    for (let gx = gx0; gx <= gx1; gx++) {
+      for (let gz = gz0; gz <= gz1; gz++) {
+        const bucket = this.covers.grid.get(gx + ':' + gz);
+        if (!bucket) continue;
+        for (const ob of bucket) {
+          if (ob._castStamp === stamp) continue; // одно препятствие — один раз
+          ob._castStamp = stamp;
+          const t = this._segHitT(ob, x0, z0, dx, dz);
+          if (t >= 0 && t < best) best = t;
+        }
+      }
+    }
+    return best * max;
+  }
+
+  // Первое пересечение отрезка (x0,z0)+t·(dx,dz), t ∈ [0,1], с препятствием; -1 — мимо.
+  _segHitT(ob, x0, z0, dx, dz) {
+    if (ob.rect) {
+      const minX = ob.x - ob.e1;
+      const maxX = ob.x + ob.e1;
+      const minZ = ob.z - ob.e2;
+      const maxZ = ob.z + ob.e2;
+      let t0 = 0;
+      let t1 = 1;
+      if (Math.abs(dx) < 1e-9) {
+        if (x0 < minX || x0 > maxX) return -1;
+      } else {
+        let a = (minX - x0) / dx;
+        let b = (maxX - x0) / dx;
+        if (a > b) { const s = a; a = b; b = s; }
+        if (a > t0) t0 = a;
+        if (b < t1) t1 = b;
+        if (t0 > t1) return -1;
+      }
+      if (Math.abs(dz) < 1e-9) {
+        if (z0 < minZ || z0 > maxZ) return -1;
+      } else {
+        let a = (minZ - z0) / dz;
+        let b = (maxZ - z0) / dz;
+        if (a > b) { const s = a; a = b; b = s; }
+        if (a > t0) t0 = a;
+        if (b < t1) t1 = b;
+        if (t0 > t1) return -1;
+      }
+      return t0;
+    }
+    // круг (ствол, валун): первое пересечение луча с окружностью
+    const fx = x0 - ob.x;
+    const fz = z0 - ob.z;
+    const C = fx * fx + fz * fz - ob.e1 * ob.e1;
+    if (C <= 0) return 0; // старт внутри ствола: дальней видимости нет
+    const A = dx * dx + dz * dz;
+    if (A < 1e-12) return -1;
+    const B = 2 * (fx * dx + fz * dz);
+    const disc = B * B - 4 * A * C;
+    if (disc <= 0) return -1;
+    const t = (-B - Math.sqrt(disc)) / (2 * A);
+    return t >= 0 && t <= 1 ? t : -1;
+  }
+
+  // Удар или пуля по NPC: imp — урон и толчок. fromPos — откуда прилетело:
+  // нужен для удара В СПИНУ (взгляд NPC отвёрнут от игрока больше 120° —
+  // backstabMult валит одним ударом). hitPoint — точка попадания: выше
+  // headZone считается голова, и headDamage (хэдшот) убивает сразу.
+  hit(i, dir, imp, fromPos, hitPoint) {
     const u = this.units[i];
     if (!u || u.dead) return false;
     u.vel.x += dir.x * (imp.knockback || 0);
@@ -150,11 +290,22 @@ export class Npcs {
     this.head.instanceColor.needsUpdate = true;
     u.aware = true;
     if (fromPos) u.lastKnown = { x: fromPos.x, z: fromPos.z };
-    u.hp -= imp.damage || 0;
+    let damage = imp.damage || 0;
+    // голова: точка попадания выше груди — хэдшот валит с одного раза
+    if (hitPoint && imp.headDamage && hitPoint.y - u.pos.y > this.cfg.headZone) damage = imp.headDamage;
+    // спина: взгляд NPC (локальная ось +z) против направления на игрока
+    if (imp.backstabMult && fromPos) {
+      const dx = fromPos.x - u.pos.x;
+      const dz = fromPos.z - u.pos.z;
+      const d = Math.hypot(dx, dz);
+      if (d > 1e-6 && (Math.sin(u.yaw) * dx + Math.cos(u.yaw) * dz) / d < -0.5) damage *= imp.backstabMult;
+    }
+    u.hp -= damage;
     if (u.hp <= 0) {
       u.hp = 0;
       u.dead = true;
       u.sees = false;
+      u.gaze = 0;
       u.target = null;
     }
     return true;
@@ -225,10 +376,19 @@ export class Npcs {
     const onTracer = (hooks && hooks.tracer) || noop;
     // присевшего игрока замечают со значительно меньшей дистанции — стелс
     const vision = this.cfg.visionRange * (opts && opts.crouch ? this.cfg.crouchVision : 1);
+    this._t += dt; // время сканирования головой
     for (const u of this.units) {
       if (u.dead) {
         u.fall = Math.min(1, u.fall + dt / FALL_TIME); // заваливается и остаётся лежать
         continue;
+      }
+      // спокойный статист сканирует головой влево-вправо — сектор обзора ходит;
+      // заметил — взгляд выравнивается, дальше доворачивается корпусом
+      if (u.static && !u.aware) {
+        u.gaze = Math.sin(this._t * this.cfg.sweepSpeed + u.gazePhase) * this._sweepRad;
+      } else if (u.gaze !== 0) {
+        u.gaze *= Math.exp(-8 * dt);
+        if (Math.abs(u.gaze) < 1e-3) u.gaze = 0;
       }
       u.thinkT -= dt;
       if (u.thinkT <= 0) {
@@ -257,6 +417,15 @@ export class Npcs {
     this._separate();
     for (let i = 0; i < this.units.length; i++) this._compose(i);
     for (const m of this.parts) m.instanceMatrix.needsUpdate = true;
+    // веер зрения: пересчёт ~30 Гц; смена дальности (присед) — сразу
+    if (this.debugOn) {
+      this._dbgT += dt;
+      if (this._dbgT >= 0.033 || this._dbgVision !== vision) {
+        this._dbgT = 0;
+        this._dbgVision = vision;
+        this._syncDebug(vision);
+      }
+    }
   }
 
   // Решение по зонам контакта; вызывается раз в thinkInterval.
@@ -264,7 +433,11 @@ export class Npcs {
   _think(u, p, vision) {
     const c = this.cfg;
     const dist = Math.hypot(p.x - u.pos.x, p.z - u.pos.z);
-    const visible = dist <= vision && this._los(u.pos.x, u.pos.z, p.x, p.z);
+    // зрение — строго зелёный конус (F3): вне его NPC слеп, за спину можно подойти
+    // вплотную; внутри конуса стены и валуны режут взгляд — как свет (_los)
+    const yawG = u.yaw + u.gaze; // статист смотрит с учётом сканирования головой
+    const ahead = Math.sin(yawG) * (p.x - u.pos.x) + Math.cos(yawG) * (p.z - u.pos.z);
+    const visible = dist <= vision && ahead >= dist * this._cosHalf && this._los(u.pos.x, u.pos.z, p.x, p.z);
     u.sees = visible;
     if (visible) {
       u.aware = true;
@@ -365,7 +538,8 @@ export class Npcs {
 
     // патрульная точка, когда идти некуда: у дома — спокойный обход,
     // после поиска — широкий район вокруг места находки
-    if (!u.target && u.pauseT <= 0 && (u.state === 'patrol' || u.state === 'search')) {
+    // статисты не патрулируют: стоят на месте, пока не заметили игрока
+    if (!u.target && u.pauseT <= 0 && (!u.static || u.aware) && (u.state === 'patrol' || u.state === 'search')) {
       const wide = u.aware && u.searchCenter;
       u.target = this._pickPatrol(wide ? u.searchCenter : u.home, wide ? c.searchPatrolRadius : c.patrolRadius);
     }
@@ -433,18 +607,20 @@ export class Npcs {
       u.pos.z = res.z;
     }
 
-    const lim = this.world.size / 2 - 3;
-    u.pos.x = Math.max(-lim, Math.min(lim, u.pos.x));
-    u.pos.z = Math.max(-lim, Math.min(lim, u.pos.z));
+    const limX = this.world.sizeX / 2 - 3;
+    const limZ = this.world.sizeZ / 2 - 3;
+    u.pos.x = Math.max(-limX, Math.min(limX, u.pos.x));
+    u.pos.z = Math.max(-limZ, Math.min(limZ, u.pos.z));
     u.pos.y = this.groundAt(u.pos.x, u.pos.z);
 
-    // разворот: в бою смотрим на игрока, в патруле — по ходу движения
+    // разворот: лицом к игроку — только пока реально видим (убежал за стену —
+    // уже нет), иначе — по ходу движения. Спокойный патруль доворачивается медленно
     let want = null;
-    if (u.aware) want = Math.atan2(p.x - u.pos.x, p.z - u.pos.z);
+    if (u.sees) want = Math.atan2(p.x - u.pos.x, p.z - u.pos.z);
     else if (dirx || dirz) want = Math.atan2(dirx, dirz);
     if (want !== null) {
       const delta = Math.atan2(Math.sin(want - u.yaw), Math.cos(want - u.yaw));
-      const mx = c.turnSpeed * dt;
+      const mx = (u.aware ? c.turnSpeed : c.patrolTurnSpeed) * dt;
       u.yaw += Math.abs(delta) <= mx ? delta : Math.sign(delta) * mx;
     }
   }
@@ -680,11 +856,12 @@ export class Npcs {
   _pickPeek(u, p) {
     const ob = u.cover && u.cover.ob;
     if (!ob) return null;
-    const lim = this.world.size / 2 - 3;
+    const limX = this.world.sizeX / 2 - 3;
+    const limZ = this.world.sizeZ / 2 - 3;
     let best = null;
     let bestScore = Infinity;
     const consider = (x, z, side) => {
-      if (Math.abs(x) > lim || Math.abs(z) > lim) return;
+      if (Math.abs(x) > limX || Math.abs(z) > limZ) return;
       if (obstacleAt(this.covers, x, z, this.cfg.radius + 0.1)) return; // место занято другим препятствием
       if (!this._los(x, z, p.x, p.z)) return; // оттуда игрока не видно
       const dNpc = Math.hypot(x - u.pos.x, z - u.pos.z);
@@ -723,7 +900,8 @@ export class Npcs {
   // Случайная точка патруля радиуса radius вокруг центра: не в стенах, не за картой.
   _pickPatrol(center, radius) {
     const city = this.covers.city;
-    const lim = this.world.size / 2 - 4;
+    const limX = this.world.sizeX / 2 - 4;
+    const limZ = this.world.sizeZ / 2 - 4;
     for (let k = 0; k < 8; k++) {
       const a = this.rng() * Math.PI * 2;
       const r = 1.5 + this.rng() * radius;
@@ -733,8 +911,8 @@ export class Npcs {
         x = Math.max(city.minX + 2, Math.min(city.maxX - 2, x)); // патруль держится города
         z = Math.max(city.minZ + 2, Math.min(city.maxZ - 2, z));
       }
-      x = Math.max(-lim, Math.min(lim, x));
-      z = Math.max(-lim, Math.min(lim, z));
+      x = Math.max(-limX, Math.min(limX, x));
+      z = Math.max(-limZ, Math.min(limZ, z));
       if (obstacleAt(this.covers, x, z, 0.8) || this._blocked(x, z)) continue; // стены и баки
       return { x, z };
     }
@@ -753,9 +931,17 @@ export class Npcs {
     this._p.set(u.pos.x, u.pos.y, u.pos.z);
     this._m.compose(this._p, this._q, ONE);
     this.body.setMatrixAt(i, this._m);
-    this.head.setMatrixAt(i, this._m);
     this.bodyShell.setMatrixAt(i, this._m);
-    this.headShell.setMatrixAt(i, this._m);
+    // голова отдельно: у статистов она сканирует (gaze поверх разворота)
+    this._q.setFromAxisAngle(UP, u.gaze ? u.yaw + u.gaze : u.yaw);
+    if (u.fall > 0) {
+      this._qa.setFromAxisAngle(X_AXIS, -(Math.PI / 2) * u.fall);
+      this._q.multiply(this._qa);
+    }
+    this._mHead.compose(this._p, this._q, ONE);
+    this.head.setMatrixAt(i, this._mHead);
+    this.headShell.setMatrixAt(i, this._mHead);
+    this.faces.setMatrixAt(i, this._mHead); // лицо живёт при голове: тот же разворот
 
     let ang;
     if (u.weapon === 'pistol') {
@@ -794,6 +980,7 @@ export class Npcs {
       u.coverFrom = { x: 0, z: 0 };
       u.peek = null;
       u.peekSide = 1;
+      u.gaze = 0;
       u.hideT = 0;
       u.target = null;
       u.pauseT = 0;
@@ -915,6 +1102,27 @@ function makeHeadGeometry(inflate = 0) {
   const head = new THREE.BoxGeometry(0.3 + inflate, 0.3 + inflate, 0.3 + inflate);
   head.translate(0, 1.66, 0);
   return head;
+}
+
+// «Лицо»: тёмная полоса глаз на передней грани головы (центр 1.66, грань +z на 0.15).
+function makeFaceGeometry() {
+  const face = new THREE.BoxGeometry(0.2, 0.05, 0.04);
+  face.translate(0, 1.68, 0.16);
+  return face;
+}
+
+// Лепесток веера зрения: единичный треугольник-луч угловой ширины span,
+// центр — локальный +z. Масштаб инстанса задаёт длину луча, разворот — направление.
+function makeVisionSlice(span) {
+  const half = span / 2;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute([
+    0, 0, 0,
+    Math.sin(-half), 0, Math.cos(-half),
+    Math.sin(half), 0, Math.cos(half),
+  ], 3));
+  g.setIndex([0, 1, 2]);
+  return g;
 }
 
 // Палка: происхождение у кисти, растёт вверх.

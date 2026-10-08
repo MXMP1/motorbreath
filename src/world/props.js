@@ -79,7 +79,8 @@ export class Props {
   }
 
   update(dt) {
-    const lim = this.world.size / 2 - 2;
+    const limX = this.world.sizeX / 2 - 2;
+    const limZ = this.world.sizeZ / 2 - 2;
     const phys = this.phys;
     let dirty = false;
 
@@ -103,8 +104,8 @@ export class Props {
       }
 
       // границы мира
-      u.pos.x = Math.max(-lim, Math.min(lim, u.pos.x));
-      u.pos.z = Math.max(-lim, Math.min(lim, u.pos.z));
+      u.pos.x = Math.max(-limX, Math.min(limX, u.pos.x));
+      u.pos.z = Math.max(-limZ, Math.min(limZ, u.pos.z));
 
       // пол: рельеф + городское покрытие + крыши коробок
       const ground = this.groundBelow(u.pos.x, u.pos.z, u.pos.y);

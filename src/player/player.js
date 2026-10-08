@@ -120,9 +120,10 @@ export class Player {
     }
 
     // границы мира
-    const lim = this.world.size / 2 - 3;
-    this.pos.x = Math.max(-lim, Math.min(lim, this.pos.x));
-    this.pos.z = Math.max(-lim, Math.min(lim, this.pos.z));
+    const limX = this.world.sizeX / 2 - 3;
+    const limZ = this.world.sizeZ / 2 - 3;
+    this.pos.x = Math.max(-limX, Math.min(limX, this.pos.x));
+    this.pos.z = Math.max(-limZ, Math.min(limZ, this.pos.z));
 
     // ---- крутой склон = стена, а не лестница
     const terrNew = this.world.heightmap.heightAt(this.pos.x, this.pos.z);

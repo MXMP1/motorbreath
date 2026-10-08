@@ -44,6 +44,20 @@
     #hitmarker::before { transform: rotate(45deg); }
     #hitmarker::after { transform: rotate(-45deg); }
 
+    /* Подсказка взаимодействия: видна, когда прицел на дружелюбном рядом */
+    #prompt {
+      position: fixed; left: 50%; bottom: 16%;
+      transform: translateX(-50%);
+      font: 13px/1.4 Consolas, "Courier New", monospace;
+      color: #f0efe4; text-shadow: 1px 1px 0 #000;
+      background: rgba(12, 14, 16, 0.55);
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      padding: 4px 10px;
+      pointer-events: none; user-select: none;
+      display: none;
+    }
+    #prompt.on { display: block; }
+
     /* Красный фильтр полученного урона: плотность задаёт main.js по остатку здоровья */
     #damage {
       position: fixed; inset: 0;
@@ -72,13 +86,14 @@
   <div id="damage"></div>
   <div id="crosshair"></div>
   <div id="hitmarker"></div>
+  <div id="prompt"></div>
   <pre id="hud"></pre>
   <div id="hint">
     <div class="title">HARD-GRAPH</div>
     <div>Клик — захватить мышь и начать</div>
     <div class="muted">WASD — движение · Shift — бег · C — присед · Пробел — прыжок</div>
-    <div class="muted">ЛКМ — применить предмет · ПКМ — прицел пистолета · 1/2 — палка/пистолет · колесо — следующее</div>
-    <div class="muted">V — разрешение · F3 — HUD · R — сброс NPC и предметов · G — новый мир</div>
+    <div class="muted">ЛКМ — применить предмет · ПКМ — прицел пистолета / бинокль палки · E — взаимодействие и мотоцикл · L — свет мотоцикла · 1/2 — палка/пистолет · колесо — следующее</div>
+    <div class="muted">V — разрешение · F3 — HUD и зоны зрения NPC · R — сброс NPC и предметов · G — новый мир</div>
   </div>
   <script type="module" src="/src/main.js"></script>
 </body>

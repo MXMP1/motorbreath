@@ -13,10 +13,12 @@ import { Bins } from './world/bins.js';
 import { TrashBags, pushBagsByBins } from './world/bags.js';
 import { Npcs, buildCovers } from './world/npc.js';
 import { Camp } from './world/camp.js';
+import { Motorcycle } from './world/bike.js';
 import { Player, hurtKick } from './player/player.js';
 import { Viewmodel } from './player/viewmodel.js';
 import { Impacts } from './world/impacts.js';
 import { Input } from './core/input.js';
+import { resolveCircleAabb } from './core/collide.js';
 import { Hud } from './core/hud.js';
 
 // ---------- рендерер: честный low-res ----------
@@ -45,7 +47,10 @@ controls.pointerSpeed = CONFIG.player.sens / 0.002;
 const hint = document.getElementById('hint');
 const damageEl = document.getElementById('damage'); // красный фильтр урона
 const hitmarkEl = document.getElementById('hitmarker'); // X в центре: попадание по NPC
+const promptEl = document.getElementById('prompt'); // подсказка «E» на дружелюбном рядом
 let hitmarkT = 0;
+let interactFriend = null; // дружелюбный под прицелом: с ним работает E
+let interactBike = false;  // мотоцикл под прицелом на дистанции посадки
 function showHitmark() { hitmarkT = CONFIG.hud.hitMarkTime; }
 document.addEventListener('click', () => { if (!controls.isLocked) controls.lock(); });
 controls.addEventListener('lock', () => hint.classList.add('hidden'));
@@ -78,9 +83,9 @@ function disposeWorld() {
   if (!world) return;
   const parts = [
     world.terrain, world.pavement.group, world.buildings.group,
-    ...world.npcs.parts, world.trees.trunks, world.trees.crowns,
+    ...world.npcs.parts, ...world.npcs.debug, world.trees.trunks, world.trees.crowns,
     world.rocks.mesh, world.bushes.mesh, world.signs.group, world.bins.mesh, world.bags.mesh,
-    world.camp.group,
+    world.camp.group, world.bike.group,
   ];
   for (const part of parts) {
     scene.remove(part);
@@ -101,6 +106,7 @@ function disposeWorld() {
 function rebuildWorld(newSeed) {
   disposeWorld();
   seed = newSeed;
+  interactFriend = null; // старый мир исчез — и цель взаимодействия тоже
   const cfg = { ...CONFIG, seed };
 
   const layout = buildLayout(cfg);
@@ -127,7 +133,8 @@ function rebuildWorld(newSeed) {
     heightmap: layout.heightmap,
     // дома + валуны + баки: сквозь них не пройти
     colliders: buildings.colliders.concat(rockColliders(layout.rocks), binCols),
-    size: CONFIG.world.size,
+    sizeX: CONFIG.world.sizeX,
+    sizeZ: CONFIG.world.sizeZ,
     cityLift: makeCityLift(cfg, layout.buildings), // высота покрытия в городе (нужна физике мешков)
     terrain,
     pavement,
@@ -146,8 +153,12 @@ function rebuildWorld(newSeed) {
   world.camp = new Camp(cfg, world); // лагерь напротив города: спавн, дружелюбные, постройки
   scene.add(world.camp.group);
   world.colliders.push(...world.camp.colliders);
+  // мотоцикл у лагеря: кинематический, корпус — коллайдер для пешеходов
+  world.bike = new Motorcycle(cfg, world);
+  scene.add(world.bike.group);
   world.npcs = new Npcs(layout.npcs, CONFIG, world, buildCovers(cfg, layout, world.camp.coverBoxes));
   world.npcs.addTo(scene);
+  world.npcs.setDebug(hud.visible); // отладочные зоны зрения живут вместе с HUD (F3)
   return world;
 }
 
@@ -190,6 +201,8 @@ let hurtYawA = 0;
 let hurtRollA = 0;
 
 function hurt(amount, from) {
+  // смертельный урон в седле: сначала слезаем, потом игрок падает на спавне
+  if (world.bike.mounted && player.hp - amount <= 0) world.bike.dismount();
   player.damage(amount);
   const h = CONFIG.player.hurt;
   dmgT = h.time;
@@ -207,7 +220,7 @@ const tmpFlat = new THREE.Vector3();
 const tmpHit = new THREE.Vector3(); // точка кровяных брызг при ударе палкой
 const raycaster = new THREE.Raycaster();
 raycaster.far = CONFIG.pistol.range;
-const PISTOL_HIT = { damage: CONFIG.pistol.damage, knockback: CONFIG.pistol.knockback }; // импульс NPC от пули
+const PISTOL_HIT = { damage: CONFIG.pistol.damage, headDamage: CONFIG.pistol.headDamage, knockback: CONFIG.pistol.knockback }; // импульс NPC от пули: в голову — хэдшот
 
 // Удар палкой: сфера по лучу взгляда — деревья качаются, NPC получает урон и злится.
 function stickHit() {
@@ -273,7 +286,7 @@ function shoot() {
   const hits = raycaster.intersectObjects(
     [world.terrain, world.pavement.group, world.buildings.group,
      world.trees.trunks, world.trees.crowns, world.rocks.mesh, world.bushes.mesh,
-     world.bins.mesh, world.signs.group, world.bags.mesh, world.camp.group, ...world.npcs.parts],
+     world.bins.mesh, world.signs.group, world.bags.mesh, world.camp.group, world.bike.group, ...world.npcs.parts],
     true,
   );
   // свист пули рядом с NPC поднимает группу: идут искать место выстрела
@@ -291,7 +304,7 @@ function shoot() {
 
   let flesh = false; // попадание по живой цели: кровь и X-маркер — есть отдача от попадания
   if (hit.object.userData.npc && hit.instanceId !== undefined) {
-    world.npcs.hit(hit.instanceId, tmpFlat, PISTOL_HIT, camera.position);
+    world.npcs.hit(hit.instanceId, tmpFlat, PISTOL_HIT, camera.position, hit.point); // hit.point — зона: голова или тело
     flesh = true;
   } else if ((hit.object === world.trees.trunks || hit.object === world.trees.crowns) && hit.instanceId !== undefined) {
     world.trees.hit(hit.instanceId);
@@ -310,6 +323,73 @@ function shoot() {
     impacts.spawn(hit.point, tmpDir); // искры о мир: стена, камень, дерево
   }
   pitchKick = CONFIG.pistol.pitchKick;
+}
+
+// Посадка: игрок садится в седло — дальше его везёт мотоцикл
+function mountBike() {
+  world.bike.mount();
+  player.pos.set(world.bike.pos.x, world.bike.pos.y, world.bike.pos.z);
+  player.syncCamera();
+  updatePrompt();
+}
+
+// Высадка: слезаем сбоку от мотоцикла; там тесно (стена) — слева
+function dismountBike() {
+  const b = world.bike;
+  b.dismount();
+  const rx = -Math.cos(b.yaw); // правый бок мотоцикла: r = (−cos, sin)
+  const rz = Math.sin(b.yaw);
+  let sx = b.pos.x + rx * 1.1;
+  let sz = b.pos.z + rz * 1.1;
+  let res = resolveCircleAabb(sx, sz, CONFIG.player.radius, b.pos.y, CONFIG.player.standHeight, world.colliders);
+  if (res.hit) { // справа тесно — слезаем слева
+    sx = b.pos.x - rx * 1.1;
+    sz = b.pos.z - rz * 1.1;
+    res = resolveCircleAabb(sx, sz, CONFIG.player.radius, b.pos.y, CONFIG.player.standHeight, world.colliders);
+  }
+  player.pos.set(res.x, b.pos.y, res.z);
+  player.pos.y = world.heightmap.heightAt(res.x, res.z);
+  player.vel.set(0, 0, 0);
+  player.syncCamera();
+  updatePrompt();
+}
+
+// Подсказка взаимодействия: прицел на дружелюбном рядом — «E»; в седле —
+// всегда «сойти»; прицел на мотоцикле в пределах посадки — «сесть».
+// Дружелюбный: раз нажал — друг идёт за игроком; ещё раз — «жди здесь».
+function updatePrompt() {
+  interactFriend = null;
+  interactBike = false;
+  if (world.bike.mounted) {
+    promptEl.textContent = '[E] — сойти с мотоцикла · L — свет';
+    promptEl.classList.add('on');
+    return;
+  }
+  if (controls.isLocked) {
+    camera.getWorldDirection(tmpDir);
+    raycaster.set(camera.position, tmpDir);
+    const hits = raycaster.intersectObjects(
+      [world.camp.standBody, world.camp.standShell, world.camp.head, world.camp.headShell, world.camp.faces],
+      false,
+    );
+    if (hits.length && hits[0].distance <= CONFIG.camp.interactRange) {
+      const f = world.camp.friendOf(hits[0].object, hits[0].instanceId);
+      if (f && !f.sit) interactFriend = f;
+    }
+    if (!interactFriend) {
+      const bh = raycaster.intersectObject(world.bike.group, true);
+      if (bh.length && bh[0].distance <= CONFIG.bike.mountRange) interactBike = true;
+    }
+  }
+  if (interactFriend) {
+    promptEl.textContent = interactFriend.mode === 'follow' ? '[E] — подожди здесь' : '[E] — взаимодействовать';
+    promptEl.classList.add('on');
+  } else if (interactBike) {
+    promptEl.textContent = '[E] — сесть на мотоцикл';
+    promptEl.classList.add('on');
+  } else {
+    promptEl.classList.remove('on');
+  }
 }
 
 // Колесо мыши: следующий/предыдущий непустой слот.
@@ -334,10 +414,23 @@ const clock = new THREE.Clock();
 const sizeVec = new THREE.Vector2();
 
 function step(dt) {
-  player.update(dt, input);
+  const riding = world.bike.mounted;
+  if (riding) {
+    // в седле игрок не ходит сам: его везёт мотоцикл, глаза — на высоте райдера
+    player.pos.set(world.bike.pos.x, world.bike.pos.y, world.bike.pos.z);
+    player.vel.set(0, 0, 0);
+    player.crouching = false;
+    player.eye += (1.35 - player.eye) * Math.min(1, dt * 10);
+    player.hSpeed = Math.abs(world.bike.speed);
+    player.state = 'мотоцикл · передача ' + (world.bike.gear + 1);
+    player.syncCamera();
+  } else {
+    player.update(dt, input);
+  }
+  world.bike.update(dt, riding ? input : null);
   // присед игрока урезает дальность обнаружения — стелс
   world.npcs.update(dt, player.pos, npcHooks, { crouch: player.crouching });
-  world.camp.update(dt, player.pos); // головы дружелюбных следят за игроком вблизи
+  world.camp.update(dt, player.pos, world.bike); // дружелюбные следят за игроком и подсаживаются пассажиром
   world.bins.update(dt);
   pushBagsByBins(world.bags, world.bins, CONFIG.street.bagPush); // проехал ли бак по мешку
   world.bags.update(dt);
@@ -348,10 +441,20 @@ function step(dt) {
       applyResolution();
     } else if (code === 'F3') {
       hud.toggle();
+      world.npcs.setDebug(hud.visible); // зоны зрения NPC — отладочный слой HUD
+    } else if (code === 'KeyE') {
+      // E: в седле — сойти; иначе — дружелюбный, иначе — сесть на мотоцикл
+      if (world.bike.mounted) dismountBike();
+      else if (interactFriend && world.camp.interact(interactFriend)) updatePrompt();
+      else if (interactBike) mountBike();
+    } else if (code === 'KeyL') {
+      // L: фара мотоцикла по кругу — выкл → ближний → дальний (в седле или рядом)
+      if (world.bike.mounted || interactBike) world.bike.toggleLight();
     } else if (code === 'KeyR') {
       world.npcs.resetAll();
       world.bins.resetAll();
       world.bags.resetAll();
+      world.bike.reset();
     } else if (code === 'KeyG') {
       rebuildWorld(seed + 1);
       player.setWorld(world);
@@ -367,7 +470,7 @@ function step(dt) {
     }
   }
 
-  if (input.consumeAttack()) viewmodel.startPrimary();
+  if (input.consumeAttack() && !world.bike.mounted) viewmodel.startPrimary(); // в седле руки на руле
 }
 
 function frame() {
@@ -379,11 +482,15 @@ function frame() {
   while (acc >= STEP && guard < 8) { step(STEP); acc -= STEP; guard++; }
   if (guard === 8) acc = 0; // не копим долг физики, если вкладка лагала
 
-  // ПКМ-прицел пистолета: обзор поджимается, вьюмодель ведёт себя сама
-  const aiming = input.rmb && controls.isLocked && viewmodel.currentId === 'pistol' && viewmodel.pendingId === null;
-  const fovTarget = aiming ? CONFIG.pistol.aimFov : CONFIG.camera.fov;
+  // ПКМ: пистолет — прицел, палка — зум-бинокль (осмотреться). Обзор поджимается,
+  // вьюмодель ведёт себя сама и читает view.aim
+  const aimCfg = viewmodel.currentId === 'pistol' ? CONFIG.pistol
+    : viewmodel.currentId === 'stick' ? CONFIG.stick : null;
+  const aiming = !!(input.rmb && controls.isLocked && aimCfg && viewmodel.pendingId === null && !world.bike.mounted);
+  const fovTarget = aiming ? aimCfg.aimFov : CONFIG.camera.fov;
   if (camera.fov !== fovTarget) {
-    camera.fov += (fovTarget - camera.fov) * (1 - Math.exp(-CONFIG.pistol.aimSpeed * dt));
+    const aimSpeed = aimCfg ? aimCfg.aimSpeed : CONFIG.pistol.aimSpeed;
+    camera.fov += (fovTarget - camera.fov) * (1 - Math.exp(-aimSpeed * dt));
     if (Math.abs(camera.fov - fovTarget) < 0.02) camera.fov = fovTarget;
     camera.updateProjectionMatrix();
   }
@@ -431,6 +538,8 @@ function frame() {
     hitmarkEl.style.opacity = '0';
   }
 
+  updatePrompt(); // подсказка «E»: прицел на дружелюбном в пределах дистанции
+
   renderer.getSize(sizeVec);
   hud.update(dt, {
     pos: player.pos,
@@ -449,7 +558,7 @@ function frame() {
     sparks: impacts.activeCount,
   });
 
-  viewmodel.render(renderer, scene, camera, aspect);
+  viewmodel.render(renderer, scene, camera, aspect, !world.bike.mounted); // в седле вьюмодель скрыта
 }
 
 frame();

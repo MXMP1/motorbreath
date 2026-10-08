@@ -108,10 +108,12 @@ export class Viewmodel {
   }
 
   // Два прохода: мир (с очисткой), затем вьюмодель поверх (только очистка depth).
-  render(renderer, scene, camera, aspect) {
+  // show=false — вьюмодель скрыта (в седле мотоцикла): рисуется только мир.
+  render(renderer, scene, camera, aspect, show = true) {
     this.camera.aspect = aspect;
     this.camera.updateProjectionMatrix();
     renderer.render(scene, camera);
+    if (!show) return;
     renderer.autoClear = false;
     renderer.clearDepth();
     renderer.render(this.scene, this.camera);

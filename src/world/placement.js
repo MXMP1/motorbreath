@@ -1,4 +1,4 @@
-import { createHeightmap } from './heightmap.js';
+import { createHeightmap, corridorDistance } from './heightmap.js';
 import { mulberry32 } from '../core/noise.js';
 
 // Расстановка всего, что стоит на карте: город (дома, знаки, баки, мешки, NPC)
@@ -8,8 +8,11 @@ import { mulberry32 } from '../core/noise.js';
 export function buildLayout(cfg) {
   const rng = mulberry32((cfg.seed ^ 0x9e3779b9) >>> 0);
   const heightmap = createHeightmap(cfg.world);
-  const { size } = cfg.world;
-  const half = size / 2;
+  const { sizeX, sizeZ } = cfg.world;
+  const halfX = sizeX / 2;
+  const halfZ = sizeZ / 2;
+  // дистанция до ровного коридора: по ней ограничиваем лес, кусты и камни
+  const corr = (x, z) => corridorDistance(cfg.world, x, z);
   const city = cfg.city;
   const cityRect = {
     minX: city.cx - city.halfW, maxX: city.cx + city.halfW,
@@ -212,6 +215,7 @@ export function buildLayout(cfg) {
         y: heightmap.heightAt(x, z) + liftAt(x, z),
         rot: rng() * Math.PI * 2,
         weapon: i % 5 < 3 ? 'pistol' : 'stick', // две трети с пистолетами
+        static: i % 3 === 0, // статист: не патрулирует, но сканирует головой (и триггеры на него действуют)
         home: { x, z },
       });
       break;
@@ -224,11 +228,9 @@ export function buildLayout(cfg) {
   const target = cfg.layout.trees;
   const treeScale = cfg.layout.treeScale;
   for (let i = 0; i < target * 14 && trees.length < target; i++) {
-    const x = (rng() * 2 - 1) * (half - 12);
-    const z = (rng() * 2 - 1) * (half - 12);
-    const r = Math.hypot(x, z);
-    if (r < 18) continue;              // у спавна лес не сажаем
-    if (r > size * 0.42) continue;     // выше в горы не лезем
+    const x = (rng() * 2 - 1) * (halfX - 12);
+    const z = (rng() * 2 - 1) * (halfZ - 12);
+    if (corr(x, z) > 105) continue;    // выше в горы не лезем: лес держится долины
     if (heightmap.slopeAt(x, z) > 0.55) continue;  // на кручах не растут
     if (inCity(x, z, city.margin)) continue;       // лес в город не заходит
     if (inCamp(x, z)) continue;                    // поляна лагеря — чистая
@@ -251,11 +253,9 @@ export function buildLayout(cfg) {
   const BGRID = 3;
   const bushGrid = new Map();
   for (let i = 0; i < bushTarget * 24 && bushes.length < bushTarget; i++) {
-    const x = (rng() * 2 - 1) * (half - 12);
-    const z = (rng() * 2 - 1) * (half - 12);
-    const r = Math.hypot(x, z);
-    if (r < 10) continue;                          // у спавна чисто
-    if (r > size * 0.42) continue;
+    const x = (rng() * 2 - 1) * (halfX - 12);
+    const z = (rng() * 2 - 1) * (halfZ - 12);
+    if (corr(x, z) > 95) continue;
     if (heightmap.slopeAt(x, z) > 0.5) continue;
     if (inCity(x, z, city.margin)) continue;       // кусты в город не лезут
     if (inCamp(x, z)) continue;                    // поляна лагеря — чистая
@@ -286,13 +286,11 @@ export function buildLayout(cfg) {
     const sMin = big ? 1.1 : 0.22;
     const sMax = big ? 2.1 : 0.65;
     const slopeMax = big ? 1.0 : 0.8;   // камни терпят кручи, деревья — нет
-    const rMax = size * (big ? 0.47 : 0.42);
+    const rMax = big ? 135 : 115;       // россыпь камней: долина и предгорья
     for (let i = 0; i < count * 16 && placed < count; i++) {
-      const x = (rng() * 2 - 1) * (half - 8);
-      const z = (rng() * 2 - 1) * (half - 8);
-      const r = Math.hypot(x, z);
-      if (r < 10) continue;                     // спавн не заваливаем
-      if (r > rMax) continue;
+      const x = (rng() * 2 - 1) * (halfX - 8);
+      const z = (rng() * 2 - 1) * (halfZ - 8);
+      if (corr(x, z) > rMax) continue;
       if (heightmap.slopeAt(x, z) > slopeMax) continue;
       if (inCity(x, z, city.margin)) continue;  // город — без камней
       if (inCamp(x, z)) continue;               // поляна лагеря — чистая

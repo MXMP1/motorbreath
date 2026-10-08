@@ -4,10 +4,11 @@ import { mulberry32, makeFbm2D } from '../core/noise.js';
 // Меш рельефа из аналитического heightmap.
 // Цвет вершин по высоте (трава -> земля -> камень -> снег) + flat shading — low-poly вид.
 export function createTerrain(heightmap, cfg) {
-  const size = cfg.world.size;
-  const seg = 128; // сетка 128x128: крупные треугольники отлично сочетаются с пиксель-стилем
+  const { sizeX, sizeZ } = cfg.world;
+  const segX = 104; // ~3.5 м клетка: крупные треугольники отлично сочетаются с пиксель-стилем
+  const segZ = 220;
 
-  const geo = new THREE.PlaneGeometry(size, size, seg, seg);
+  const geo = new THREE.PlaneGeometry(sizeX, sizeZ, segX, segZ);
   geo.rotateX(-Math.PI / 2);
 
   const jitter = makeFbm2D(mulberry32((cfg.seed ^ 0x51ed270b) >>> 0), 3, 2, 0.5);
