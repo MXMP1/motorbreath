@@ -12,6 +12,7 @@ import { Signs } from './world/signs.js';
 import { Bins } from './world/bins.js';
 import { TrashBags, pushBagsByBins } from './world/bags.js';
 import { Npcs, buildCovers } from './world/npc.js';
+import { Camp } from './world/camp.js';
 import { Player, hurtKick } from './player/player.js';
 import { Viewmodel } from './player/viewmodel.js';
 import { Impacts } from './world/impacts.js';
@@ -74,6 +75,7 @@ function disposeWorld() {
     world.terrain, world.pavement.group, world.buildings.group,
     ...world.npcs.parts, world.trees.trunks, world.trees.crowns,
     world.rocks.mesh, world.bushes.mesh, world.signs.group, world.bins.mesh, world.bags.mesh,
+    world.camp.group,
   ];
   for (const part of parts) {
     scene.remove(part);
@@ -136,6 +138,9 @@ function rebuildWorld(newSeed) {
   scene.add(world.bins.mesh);
   world.bags = new TrashBags(layout.bags, CONFIG, world);
   scene.add(world.bags.mesh);
+  world.camp = new Camp(cfg, world); // лагерь напротив города: спавн, дружелюбные, постройки
+  scene.add(world.camp.group);
+  world.colliders.push(...world.camp.colliders);
   world.npcs = new Npcs(layout.npcs, CONFIG, world, buildCovers(cfg, layout));
   world.npcs.addTo(scene);
   return world;
@@ -259,9 +264,11 @@ function shoot() {
   const hits = raycaster.intersectObjects(
     [world.terrain, world.pavement.group, world.buildings.group,
      world.trees.trunks, world.trees.crowns, world.rocks.mesh, world.bushes.mesh,
-     world.bins.mesh, world.signs.group, world.bags.mesh, ...world.npcs.parts],
+     world.bins.mesh, world.signs.group, world.bags.mesh, world.camp.group, ...world.npcs.parts],
     true,
   );
+  // свист пули рядом с NPC поднимает группу: идут искать место выстрела
+  world.npcs.alertShot(camera.position, tmpDir, hits.length ? hits[0].distance : CONFIG.pistol.range);
   if (hits.length === 0) return;
   const hit = hits[0];
 
@@ -310,6 +317,7 @@ const sizeVec = new THREE.Vector2();
 function step(dt) {
   player.update(dt, input);
   world.npcs.update(dt, player.pos, npcHooks);
+  world.camp.update(dt, player.pos); // головы дружелюбных следят за игроком вблизи
   world.bins.update(dt);
   pushBagsByBins(world.bags, world.bins, CONFIG.street.bagPush); // проехал ли бак по мешку
   world.bags.update(dt);
@@ -351,8 +359,17 @@ function frame() {
   while (acc >= STEP && guard < 8) { step(STEP); acc -= STEP; guard++; }
   if (guard === 8) acc = 0; // не копим долг физики, если вкладка лагала
 
+  // ПКМ-прицел пистолета: обзор поджимается, вьюмодель ведёт себя сама
+  const aiming = input.rmb && controls.isLocked && viewmodel.currentId === 'pistol' && viewmodel.pendingId === null;
+  const fovTarget = aiming ? CONFIG.pistol.aimFov : CONFIG.camera.fov;
+  if (camera.fov !== fovTarget) {
+    camera.fov += (fovTarget - camera.fov) * (1 - Math.exp(-CONFIG.pistol.aimSpeed * dt));
+    if (Math.abs(camera.fov - fovTarget) < 0.02) camera.fov = fovTarget;
+    camera.updateProjectionMatrix();
+  }
+
   // визуальный слой — по реальному времени кадра
-  viewmodel.update(dt, { speed: player.hSpeed, onGround: player.onGround });
+  viewmodel.update(dt, { speed: player.hSpeed, onGround: player.onGround, aim: aiming });
   impacts.update(dt);
   const swaying = world.trees.update(dt) + world.bushes.update(dt);
 

@@ -11,6 +11,8 @@ export class Player {
     this.camera = camera;
     this.cfg = cfg.player;
     this.world = world; // { heightmap, colliders, size }
+    // точка респауна — лагерь на стороне карты напротив города
+    this.spawn = { x: cfg.camp.x + cfg.camp.spawnDx, z: cfg.camp.z + cfg.camp.spawnDz };
 
     this.pos = new THREE.Vector3(); // ноги игрока
     this.vel = new THREE.Vector3();
@@ -35,8 +37,8 @@ export class Player {
   }
 
   respawn() {
-    this.pos.set(0, 0, 0);
-    this.pos.y = this.world.heightmap.heightAt(0, 0);
+    this.pos.set(this.spawn.x, 0, this.spawn.z);
+    this.pos.y = this.world.heightmap.heightAt(this.spawn.x, this.spawn.z);
     this.vel.set(0, 0, 0);
     this.onGround = true;
     this.crouching = false;

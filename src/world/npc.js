@@ -8,6 +8,7 @@ const X_AXIS = new THREE.Vector3(1, 0, 0);
 const ONE = new THREE.Vector3(1, 1, 1);
 const HAND = { x: 0.34, y: 1.02, z: 0.16 }; // кисть правой руки: сюда крепится оружие
 const FALL_TIME = 0.45; // сколько NPC заваливается после смерти, с
+export const SHELL = 0.07; // на сколько тёмный контур раздувает тело, м — силуэт читается вдали
 const noop = () => {};
 
 // NPC: три зоны контакта с игроком —
@@ -16,9 +17,11 @@ const noop = () => {};
 //      выбегают на очередь 2–4 выстрела (с разбросом — мажут), отстрелялись —
 //      прячутся за угол и через паузу выбегают снова;
 //   3) вне видимости: реакции нет; если контакт уже был — ищут игрока у последнего
-//      места и патрулируют район находки.
+//      места и широко патрулируют район находки. Выстрел рядом (alertShot):
+//      услышавший свист пули и его группа идут искать место выстрела.
 // Живут в городе: патруль крутится вокруг дома. Рисуются одним набором
-// instanced-мешей (тело, голова, палки, пистолеты) — 20 NPC стоят почти как один.
+// instanced-мешей (тело, голова, палки, пистолеты и тёмные контуры силуэта) —
+// все NPC стоят почти как один.
 export class Npcs {
   constructor(list, cfg, world, covers) {
     this.cfg = cfg.npc;
@@ -36,7 +39,11 @@ export class Npcs {
     this.head = new THREE.InstancedMesh(makeHeadGeometry(), new THREE.MeshLambertMaterial({ color: cfg.palette.npcHead, flatShading: true }), list.length);
     this.sticks = new THREE.InstancedMesh(makeStickGeometry(), new THREE.MeshLambertMaterial({ color: cfg.palette.trunk, flatShading: true }), nStick);
     this.guns = new THREE.InstancedMesh(makeGunGeometry(), new THREE.MeshLambertMaterial({ color: cfg.palette.npcGun, flatShading: true }), list.length - nStick);
-    this.parts = [this.body, this.head, this.sticks, this.guns];
+    // контур силуэта: чуть раздутая тёмная копия корпуса и головы (рисуется
+    // изнутри, BackSide) — на дистанции NPC не растворяется в пикселях фона
+    this.bodyShell = new THREE.InstancedMesh(makeBodyGeometry(SHELL), new THREE.MeshBasicMaterial({ color: cfg.palette.npcOutline, side: THREE.BackSide }), list.length);
+    this.headShell = new THREE.InstancedMesh(makeHeadGeometry(SHELL), new THREE.MeshBasicMaterial({ color: cfg.palette.npcOutline, side: THREE.BackSide }), list.length);
+    this.parts = [this.body, this.head, this.sticks, this.guns, this.bodyShell, this.headShell];
     for (const m of this.parts) {
       m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
       m.frustumCulled = false; // NPC ходят: коробка отсечения меша тут не годится
@@ -138,6 +145,52 @@ export class Npcs {
       u.target = null;
     }
     return true;
+  }
+
+  // Выстрел игрока: пуля, просвистевшая рядом, поднимает NPC и его соседей —
+  // группа идёт искать место выстрела. Новый выстрел перенацеливает и тех,
+  // кто уже идёт искать: обновляем зону; не трогаем только воюющих (видят игрока).
+  // Зовётся из main на каждый выстрел.
+  alertShot(from, dir, len) {
+    const c = this.cfg;
+    const r2 = c.shotAlertRadius * c.shotAlertRadius;
+    const heard = [];
+    for (const u of this.units) {
+      if (u.dead || u.sees) continue; // в бою цель не сбиваем
+      // ближайшее приближение пули к корпусу NPC по отрезку выстрела
+      const rx = u.pos.x - from.x;
+      const ry = u.pos.y + 1 - from.y;
+      const rz = u.pos.z - from.z;
+      let t = rx * dir.x + ry * dir.y + rz * dir.z;
+      t = t < 0 ? 0 : t > len ? len : t;
+      const ox = rx - dir.x * t;
+      const oy = ry - dir.y * t;
+      const oz = rz - dir.z * t;
+      if (ox * ox + oy * oy + oz * oz > r2) continue;
+      this._alert(u, from);
+      heard.push(u);
+    }
+    if (heard.length === 0) return;
+    // соседи рядом с услышавшими тоже идут: тревожится вся группа
+    const g2 = c.shotAlertGroup * c.shotAlertGroup;
+    for (const u of this.units) {
+      if (u.dead || u.sees || heard.includes(u)) continue;
+      for (const a of heard) {
+        const dx = a.pos.x - u.pos.x;
+        const dz = a.pos.z - u.pos.z;
+        if (dx * dx + dz * dz < g2) { this._alert(u, from); break; }
+      }
+    }
+  }
+
+  // Поднять по тревоге: место выстрела — последняя известная точка, дальше обычный поиск.
+  _alert(u, from) {
+    u.aware = true;
+    u.lastKnown = { x: from.x, z: from.z };
+    u.target = u.lastKnown; // сразу разворачиваются к месту выстрела, не ждём «думания»
+    u.state = 'search';
+    u.hideT = 0;
+    u.pauseT = 0;
   }
 
   update(dt, playerPos, hooks) {
@@ -256,16 +309,20 @@ export class Npcs {
     }
     u.hideT = 0;
     u.cover = null;
-    u.target = u.lastKnown ? { x: u.lastKnown.x, z: u.lastKnown.z } : null;
+    // известно место игрока/выстрела — идём туда; иначе цель не трогаем: патрульная
+    // точка района поиска держится до прибытия, а не перескакивает каждый тик
+    if (u.lastKnown) u.target = { x: u.lastKnown.x, z: u.lastKnown.z };
   }
 
   _move(u, dt, p) {
     const c = this.cfg;
     u.pauseT = Math.max(0, u.pauseT - dt);
 
-    // патрульная точка, когда идти некуда (спокойный обход или поиск)
+    // патрульная точка, когда идти некуда: у дома — спокойный обход,
+    // после поиска — широкий район вокруг места находки
     if (!u.target && u.pauseT <= 0 && (u.state === 'patrol' || u.state === 'search')) {
-      u.target = this._pickPatrol(u.aware ? (u.searchCenter || u.home) : u.home);
+      const wide = u.aware && u.searchCenter;
+      u.target = this._pickPatrol(wide ? u.searchCenter : u.home, wide ? c.searchPatrolRadius : c.patrolRadius);
     }
 
     let dirx = 0;
@@ -618,13 +675,13 @@ export class Npcs {
     return null;
   }
 
-  // Случайная точка патруля вокруг центра: в городе, не в стенах, не за картой.
-  _pickPatrol(center) {
+  // Случайная точка патруля радиуса radius вокруг центра: не в стенах, не за картой.
+  _pickPatrol(center, radius) {
     const city = this.covers.city;
     const lim = this.world.size / 2 - 4;
     for (let k = 0; k < 8; k++) {
       const a = this.rng() * Math.PI * 2;
-      const r = 1.5 + this.rng() * this.cfg.patrolRadius;
+      const r = 1.5 + this.rng() * radius;
       let x = center.x + Math.cos(a) * r;
       let z = center.z + Math.sin(a) * r;
       if (city && center.x > city.minX && center.x < city.maxX && center.z > city.minZ && center.z < city.maxZ) {
@@ -652,6 +709,8 @@ export class Npcs {
     this._m.compose(this._p, this._q, ONE);
     this.body.setMatrixAt(i, this._m);
     this.head.setMatrixAt(i, this._m);
+    this.bodyShell.setMatrixAt(i, this._m);
+    this.headShell.setMatrixAt(i, this._m);
 
     let ang;
     if (u.weapon === 'pistol') {
@@ -780,18 +839,20 @@ function insertObstacle(grid, ob, cell) {
 }
 
 // Тело NPC: куртка + ноги, один слитый меш; происхождение — на уровне ног.
-function makeBodyGeometry() {
-  const torso = new THREE.BoxGeometry(0.52, 0.78, 0.3);
+// inflate — раздутие для тёмного контура силуэта (рисуется BackSide).
+// Экспорт — лагерь дружелюбных переиспользует эту же геометрию для стоящих.
+export function makeBodyGeometry(inflate = 0) {
+  const torso = new THREE.BoxGeometry(0.52 + inflate, 0.78 + inflate, 0.3 + inflate);
   torso.translate(0, 1.11, 0);
-  const legL = new THREE.BoxGeometry(0.18, 0.72, 0.2);
+  const legL = new THREE.BoxGeometry(0.18 + inflate, 0.72 + inflate, 0.2 + inflate);
   legL.translate(-0.13, 0.36, 0);
   const legR = legL.clone();
   legR.translate(0.26, 0, 0);
   return mergeGeometries([torso, legL, legR]);
 }
 
-function makeHeadGeometry() {
-  const head = new THREE.BoxGeometry(0.3, 0.3, 0.3);
+function makeHeadGeometry(inflate = 0) {
+  const head = new THREE.BoxGeometry(0.3 + inflate, 0.3 + inflate, 0.3 + inflate);
   head.translate(0, 1.66, 0);
   return head;
 }

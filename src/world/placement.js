@@ -18,6 +18,10 @@ export function buildLayout(cfg) {
   const inCity = (x, z, margin) =>
     x > cityRect.minX - margin && x < cityRect.maxX + margin &&
     z > cityRect.minZ - margin && z < cityRect.maxZ + margin;
+  // поляна лагеря (дружелюбные на стороне напротив города): лес и камни туда не заходят
+  const camp = cfg.camp;
+  const inCamp = (x, z) =>
+    (x - camp.x) ** 2 + (z - camp.z) ** 2 < camp.clearing ** 2;
   const inRect = (x, z, inset) =>
     x > cityRect.minX + inset && x < cityRect.maxX - inset &&
     z > cityRect.minZ + inset && z < cityRect.maxZ - inset;
@@ -227,6 +231,7 @@ export function buildLayout(cfg) {
     if (r > size * 0.42) continue;     // выше в горы не лезем
     if (heightmap.slopeAt(x, z) > 0.55) continue;  // на кручах не растут
     if (inCity(x, z, city.margin)) continue;       // лес в город не заходит
+    if (inCamp(x, z)) continue;                    // поляна лагеря — чистая
     if (overlapsAny(x, z, 5, 5, buildings)) continue;
     if (nearAny(treeGrid, x, z, 4.6, GRID)) continue; // кроны крупные — дистанция больше
 
@@ -253,6 +258,7 @@ export function buildLayout(cfg) {
     if (r > size * 0.42) continue;
     if (heightmap.slopeAt(x, z) > 0.5) continue;
     if (inCity(x, z, city.margin)) continue;       // кусты в город не лезут
+    if (inCamp(x, z)) continue;                    // поляна лагеря — чистая
     if (overlapsAny(x, z, 3, 3, buildings)) continue;
     if (nearAny(treeGrid, x, z, 2.0, GRID)) continue;   // не в стволах
     if (nearAny(bushGrid, x, z, 2.2, BGRID)) continue;  // куст к кусту не вплотную
@@ -289,6 +295,7 @@ export function buildLayout(cfg) {
       if (r > rMax) continue;
       if (heightmap.slopeAt(x, z) > slopeMax) continue;
       if (inCity(x, z, city.margin)) continue;  // город — без камней
+      if (inCamp(x, z)) continue;               // поляна лагеря — чистая
       if (overlapsAny(x, z, 3, 3, buildings)) continue;
       if (nearAny(rockGrid, x, z, big ? 3.2 : 1.4, RGRID)) continue;
       if (big && nearAny(treeGrid, x, z, 2.2, GRID)) continue;  // валуны не растут из стволов

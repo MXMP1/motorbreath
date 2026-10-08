@@ -13,9 +13,9 @@ export class Item {
   applyPose(dt, view, pose) {
     let { px, py, pz, rx, ry, rz } = pose;
 
-    // покачивание при ходьбе
+    // покачивание при ходьбе (в прицеле почти незаметно — ствол держим ровно)
     this.bobPhase += dt * view.speed * 1.9;
-    const amp = view.onGround ? Math.min(1, view.speed / 6) : 0.15;
+    const amp = (view.onGround ? Math.min(1, view.speed / 6) : 0.15) * (view.aim ? 0.3 : 1);
     px += Math.cos(this.bobPhase) * 0.01 * amp;
     py += Math.sin(this.bobPhase * 2) * 0.014 * amp;
 

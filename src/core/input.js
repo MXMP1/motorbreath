@@ -6,6 +6,7 @@ export class Input {
     this.keys = new Set();
     this.pressed = [];        // нажатия за кадр (для хоткеев V/F3/R/G)
     this.attackQueued = false;
+    this.rmb = false;         // ПКМ удерживается: прицел пистолета
 
     window.addEventListener('keydown', (e) => {
       if (!e.repeat) this.pressed.push(e.code);
@@ -14,10 +15,15 @@ export class Input {
       if (e.code === 'Space' || e.code === 'F3') e.preventDefault();
     });
     window.addEventListener('keyup', (e) => this.keys.delete(e.code));
-    window.addEventListener('blur', () => this.keys.clear());
+    window.addEventListener('blur', () => { this.keys.clear(); this.rmb = false; });
 
     window.addEventListener('mousedown', (e) => {
-      if (e.button === 0 && this.controls.isLocked) this.attackQueued = true;
+      if (!this.controls.isLocked) return;
+      if (e.button === 0) this.attackQueued = true;
+      else if (e.button === 2) this.rmb = true; // ПКМ: пистолет в прицел
+    });
+    window.addEventListener('mouseup', (e) => {
+      if (e.button === 2) this.rmb = false;
     });
     window.addEventListener('contextmenu', (e) => e.preventDefault());
 

@@ -10,6 +10,7 @@ import { Bushes } from '../src/world/bushes.js';
 import { Bins } from '../src/world/bins.js';
 import { TrashBags, pushBagsByBins } from '../src/world/bags.js';
 import { Npcs, buildCovers } from '../src/world/npc.js';
+import { Camp } from '../src/world/camp.js';
 import { createHeightmap } from '../src/world/heightmap.js';
 import { resolveCircleAabb, groundHeightAt } from '../src/core/collide.js';
 import { Player, hurtKick } from '../src/player/player.js';
@@ -79,6 +80,11 @@ check('нпс на покрытии, не в домах', layout.npcs.every((n) 
   !inBuilding(n.x, n.z, 1) && Math.abs(n.y - (hm.heightAt(n.x, n.z) + npcLift(n.x, n.z))) < 1e-6));
 check('нпс делятся на палочников и стрелков', layout.npcs.filter((n) => n.weapon === 'stick').length >= 6 &&
   layout.npcs.filter((n) => n.weapon === 'pistol').length >= 6);
+const campClear = (x, z) => Math.hypot(x - cfg.camp.x, z - cfg.camp.z) >= cfg.camp.clearing - 1e-6;
+check('поляна лагеря чиста: без леса, кустов и камней',
+  layout.trees.every((t) => campClear(t.x, t.z)) &&
+  layout.bushes.every((b) => campClear(b.x, b.z)) &&
+  layout.rocks.every((r0) => campClear(r0.x, r0.z)));
 
 // ---------- C. Коллизии ----------
 console.log('\nC. Коллизии');
@@ -110,8 +116,13 @@ const keys = { forward: true, back: false, left: false, right: false, sprint: fa
 const stepN = (n, dt = 1 / 120) => { for (let i = 0; i < n; i++) player.update(dt, keys); };
 
 player.respawn();
+const campSpawnX = CONFIG.camp.x + CONFIG.camp.spawnDx;
+const campSpawnZ = CONFIG.camp.z + CONFIG.camp.spawnDz;
+check('спавн игрока в лагере', Math.abs(player.pos.x - campSpawnX) < 0.01 && Math.abs(player.pos.z - campSpawnZ) < 0.01,
+  `x=${player.pos.x.toFixed(1)} z=${player.pos.z.toFixed(1)}`);
+const startZ = player.pos.z;
 stepN(360); // 3 секунды шагом вперёд (-z)
-check('идёт вперёд (z < -15)', player.pos.z < -15, `z=${player.pos.z.toFixed(2)}`);
+check('идёт вперёд (> 15 м за 3 с)', player.pos.z < startZ - 15, `dz=${(startZ - player.pos.z).toFixed(1)}`);
 check('скорость ≈ walkSpeed', Math.abs(player.hSpeed - CONFIG.player.walkSpeed) < 0.3, `v=${player.hSpeed.toFixed(2)}`);
 check('ноги на рельефе', Math.abs(player.pos.y - hm.heightAt(player.pos.x, player.pos.z)) < 0.01);
 check('координаты конечны', Number.isFinite(player.pos.x) && Number.isFinite(player.pos.y) && Number.isFinite(player.pos.z));
@@ -128,7 +139,8 @@ check('присед опускает глаза', player.eye < CONFIG.player.cro
 keys.crouch = false;
 
 // прыжок: держим 1 тик и смотрим максимальную высоту
-player.setWorld(openWorld); // респавн на ровном центре
+player.spawn = { x: 0, z: 0 }; // прыжок и стена гоняются на ровном центре карты
+player.setWorld(openWorld);
 const groundY = player.pos.y;
 keys.forward = false;
 keys.jump = true;
@@ -162,9 +174,11 @@ player.damage(30);
 check('урон снимает hp', Math.abs(player.hp - 70) < 1e-6, `hp=${player.hp}`);
 stepN(840); // 7 с: 5 с паузы регена + 2 с восстановления
 check('hp восстанавливается после паузы', player.hp > 70, `hp=${player.hp.toFixed(1)}`);
+player.spawn = { x: campSpawnX, z: campSpawnZ }; // возвращаем лагерный спавн
 player.damage(999);
-check('смерть — респавн с полным hp', player.hp === CONFIG.player.maxHp &&
-  Math.hypot(player.pos.x, player.pos.z) < 0.01);
+check('смерть — респавн в лагере с полным hp', player.hp === CONFIG.player.maxHp &&
+  Math.abs(player.pos.x - campSpawnX) < 0.01 && Math.abs(player.pos.z - campSpawnZ) < 0.01,
+  `x=${player.pos.x.toFixed(1)} z=${player.pos.z.toFixed(1)}`);
 
 // качение камеры: сторона удара задаёт знаки рывков (взгляд — на -z)
 const kRight = hurtKick(player.pos.x + 1, player.pos.z, player.pos.x, player.pos.z, 0, -1, CONFIG.player.hurt);
@@ -200,6 +214,16 @@ const gaps = shotTicks.slice(1).map((t, i) => t - shotTicks[i]);
 const minGap = gaps.length ? Math.min(...gaps) : Infinity;
 check('выстрелов за 2 с ≈ 2 / cooldown', shotTicks.length >= 8 && shotTicks.length <= 9, `shots=${shotTicks.length}`);
 check('интервал не меньше cooldown', minGap >= CONFIG.pistol.fireCooldown * 120 - 1.01, `minGap=${minGap} тиков`);
+
+// ПКМ-прицел: пистолет встаёт по центру экрана и возвращается обратно
+const viewAim = { speed: 0, onGround: true, aim: true };
+for (let i = 0; i < 120; i++) vm.update(1 / 120, viewAim);
+check('ПКМ поднимает пистолет в прицел (по центру)', Math.abs(pistol.group.position.x) < 0.02 &&
+  Math.abs(pistol.group.position.y + 0.16) < 0.02,
+  `x=${pistol.group.position.x.toFixed(2)} y=${pistol.group.position.y.toFixed(2)}`);
+for (let i = 0; i < 240; i++) vm.update(1 / 120, viewStub);
+check('без ПКМ пистолет возвращается в руку', Math.abs(pistol.group.position.x - 0.28) < 0.02,
+  `x=${pistol.group.position.x.toFixed(2)}`);
 
 // искры от попаданий
 const imp = new Impacts(CONFIG);
@@ -399,7 +423,8 @@ const crowd = new Npcs([
   { x: 0, z: 0, y: 0, rot: 0, weapon: 'stick', home: { x: 0, z: 0 } },
   { x: 0, z: 10, y: 0, rot: 0, weapon: 'pistol', home: { x: 0, z: 10 } },
 ], CONFIG, npcWorld, emptyCovers);
-check('NPC живут одним набором instanced-мешей', crowd.parts.length === 4 && crowd.body.count === 2);
+check('NPC живут одним набором instanced-мешей (корпус, контуры, оружие)',
+  crowd.parts.length === 6 && crowd.body.count === 2 && crowd.bodyShell.count === 2);
 const farPlayer = new THREE.Vector3(0, 0, 60);
 for (let i = 0; i < 600; i++) crowd.update(1 / 60, farPlayer, far.hooks);
 check('зона вне видимости: игрока игнорируют', crowd.alertCount === 0 && far.ev.dmg.length === 0 && far.ev.shots === 0);
@@ -491,6 +516,67 @@ const wd = Math.hypot(wu.pos.x, wu.pos.z - 10);
 check('палочник обходит мусорный бак', wu.pos.z > 5 && wd < 3.5,
   `z=${wu.pos.z.toFixed(1)} d=${wd.toFixed(1)}`);
 
+// свист пули рядом: услышавший и его соседи идут искать место выстрела
+const alarm = mkHooks();
+const squad = new Npcs([
+  { x: 0, z: 0, y: 0, rot: 0, weapon: 'stick', home: { x: 0, z: 0 } },    // пуля прошла рядом
+  { x: 4, z: 0, y: 0, rot: 0, weapon: 'pistol', home: { x: 4, z: 0 } },   // сосед по группе
+  { x: 40, z: 0, y: 0, rot: 0, weapon: 'stick', home: { x: 40, z: 0 } },  // далеко: не слышит
+  { x: 0, z: 25, y: 0, rot: 0, weapon: 'pistol', home: { x: 0, z: 25 } }, // не на пути пули
+], CONFIG, npcWorld, emptyCovers);
+const shotFrom = { x: -10, y: hm.heightAt(0, 0) + 1, z: 0 };
+squad.alertShot(shotFrom, { x: 1, y: 0, z: 0 }, 30);
+check('пуля рядом: услышавший и сосед подняты, дальние спокойны', squad.alertCount === 2,
+  `alert=${squad.alertCount}`);
+check('место выстрела запомнено', squad.units[0].lastKnown !== null && Math.abs(squad.units[0].lastKnown.x + 10) < 1e-6);
+const alarmPlayer = new THREE.Vector3(0, 0, 200);
+let minAlarmD = Infinity;
+for (let i = 0; i < 600; i++) {
+  squad.update(1 / 60, alarmPlayer, alarm.hooks);
+  minAlarmD = Math.min(minAlarmD, Math.hypot(squad.units[0].pos.x + 10, squad.units[0].pos.z));
+}
+check('услышавшие выстрел дошли до его места', minAlarmD < 1.5, `minD=${minAlarmD.toFixed(2)}`);
+check('место выстрела стало районом поиска', squad.units[0].searchCenter !== null);
+
+// выстрел далеко ото всех: тревоги нет
+const deaf = new Npcs([
+  { x: 0, z: 0, y: 0, rot: 0, weapon: 'stick', home: { x: 0, z: 0 } },
+], CONFIG, npcWorld, emptyCovers);
+deaf.alertShot({ x: 100, y: 20, z: 100 }, { x: 0, y: 0, z: 1 }, 20);
+check('далёкий выстрел никого не поднимает', deaf.alertCount === 0);
+
+// новый выстрел перенацеливает уже разбуженную группу (а не только спящих)
+const squad2 = new Npcs([
+  { x: 0, z: 0, y: 0, rot: 0, weapon: 'stick', home: { x: 0, z: 0 } },
+  { x: 4, z: 0, y: 0, rot: 0, weapon: 'pistol', home: { x: 4, z: 0 } },
+], CONFIG, npcWorld, emptyCovers);
+squad2.alertShot({ x: -10, y: hm.heightAt(0, 0) + 1, z: 0 }, { x: 1, y: 0, z: 0 }, 30);
+const shotNew = { x: 0, y: hm.heightAt(0, 0) + 1, z: 10 };
+squad2.alertShot(shotNew, { x: 0, y: 0, z: -1 }, 20);
+check('новый выстрел обновляет зону поиска группы',
+  Math.abs(squad2.units[0].lastKnown.z - 10) < 1e-6 && Math.abs(squad2.units[1].lastKnown.z - 10) < 1e-6,
+  `z0=${squad2.units[0].lastKnown.z} z1=${squad2.units[1].lastKnown.z}`);
+// воющего (видит игрока) выстрел мимо цели не отвлекает
+squad2.units[0].sees = true;
+squad2.units[0].lastKnown = { x: 7, z: 7 };
+squad2.alertShot({ x: -30, y: hm.heightAt(0, 0) + 1, z: 0 }, { x: 1, y: 0, z: 0 }, 60);
+check('воюющего NPC выстрел мимо не отвлекает',
+  squad2.units[0].lastKnown.x === 7 && squad2.units[0].lastKnown.z === 7);
+
+// после поиска угрозы патруль широкий: обходят район находки, а не пятачок
+const wide = new Npcs([
+  { x: 0, z: 0, y: 0, rot: 0, weapon: 'stick', home: { x: 0, z: 0 } },
+], CONFIG, npcWorld, emptyCovers);
+wide.units[0].aware = true;
+wide.units[0].searchCenter = { x: 0, z: 0 };
+let maxPatrol = 0;
+for (let i = 0; i < 3600; i++) {
+  wide.update(1 / 60, alarmPlayer, alarm.hooks);
+  maxPatrol = Math.max(maxPatrol, Math.hypot(wide.units[0].pos.x, wide.units[0].pos.z));
+}
+check('патруль после поиска ходит шире прежнего', maxPatrol > CONFIG.npc.patrolRadius + 2 &&
+  maxPatrol < CONFIG.npc.searchPatrolRadius + 2, `max=${maxPatrol.toFixed(1)}`);
+
 // смерть и воскрешение по R
 const duel = mkHooks();
 const lone = new Npcs([
@@ -514,6 +600,26 @@ for (let i = 0; i < 600; i++) npcsView.update(1 / 60, new THREE.Vector3(0, 0, 0)
 check('патруль не выходит из города', npcsView.units.every((u) =>
   u.pos.x > cityZone.minX - 1 && u.pos.x < cityZone.maxX + 1 &&
   u.pos.z > cityZone.minZ - 1 && u.pos.z < cityZone.maxZ + 1));
+
+// ---------- H. Лагерь ----------
+console.log('\nH. Лагерь');
+const camp = new Camp(CONFIG, { heightmap: hm });
+check('лагерь собран: постройки и четверо дружелюбных',
+  camp.group.children.length > 10 && camp.friends.length === 4 && camp.colliders.length >= 3);
+const tentTry = resolveCircleAabb(camp.tent.x, camp.tent.z, 0.4, camp.tent.gy + 0.5, 1.8, camp.colliders);
+check('палатка не пропускает сквозь себя', tentTry.hit);
+const spawnTry = resolveCircleAabb(CONFIG.camp.x + CONFIG.camp.spawnDx, CONFIG.camp.z + CONFIG.camp.spawnDz,
+  0.4, hm.heightAt(CONFIG.camp.x + CONFIG.camp.spawnDx, CONFIG.camp.z + CONFIG.camp.spawnDz), 1.8, camp.colliders);
+check('спавн игрока не торчит в постройках', !spawnTry.hit);
+const f0 = camp.friends[0];
+const nearCamp = new THREE.Vector3(f0.x + 3, 0, f0.z + 3);
+for (let i = 0; i < 300; i++) camp.update(1 / 60, nearCamp);
+check('головы дружелюбных поворачиваются на близкого игрока', Math.abs(f0.headYaw) > 0.5,
+  `yaw=${f0.headYaw.toFixed(2)}`);
+const farCamp = new THREE.Vector3(f0.x + 100, 0, f0.z);
+for (let i = 0; i < 300; i++) camp.update(1 / 60, farCamp);
+check('игрок ушёл — головы возвращаются к костру', Math.abs(f0.headYaw) < 0.08,
+  `yaw=${f0.headYaw.toFixed(2)}`);
 
 // ---------- Итог ----------
 console.log(`\nИтог: ${pass} ok, ${fail} FAIL`);

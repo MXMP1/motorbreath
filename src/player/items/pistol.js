@@ -8,6 +8,8 @@ export class PistolItem extends Item {
     super({ px: 0.28, py: -0.34, pz: -0.5, rx: -0.06, ry: 0.1, rz: 0 });
     this.cfg = cfg;
     this.label = 'пистолет';
+    // поза «в прицеле» (ПКМ): ствол по центру экрана, планки на уровне глаз
+    this.aimBase = { px: 0, py: -0.16, pz: -0.46, rx: 0, ry: 0, rz: 0 };
 
     const steel = new THREE.MeshLambertMaterial({ color: 0x3d4046, flatShading: true });
     const dark = new THREE.MeshLambertMaterial({ color: 0x24262b, flatShading: true });
@@ -24,13 +26,21 @@ export class PistolItem extends Item {
     this.slide.position.set(0, 0.09, -0.07);
     this.group.add(this.slide);
 
-    // ствол-носик и мушка
+    // ствол-носик и мушка — передняя планка прицела, приземистая
     const muzzle = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.05, 0.06), dark);
     muzzle.position.set(0, 0.06, -0.3);
     this.group.add(muzzle);
-    const sight = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.03, 0.02), dark);
-    sight.position.set(0, 0.15, -0.22);
+    const sight = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.022, 0.02), dark);
+    sight.position.set(0, 0.149, -0.22);
     this.group.add(sight);
+
+    // задние планки на слайде: две стойки с разрезом по центру — целик для ПКМ
+    const rearL = new THREE.Mesh(new THREE.BoxGeometry(0.024, 0.024, 0.03), dark);
+    rearL.position.set(-0.022, 0.06, 0.155);
+    this.slide.add(rearL);
+    const rearR = rearL.clone();
+    rearR.position.x = 0.022;
+    this.slide.add(rearR);
 
     // рукоять под наклоном + основание магазина
     const grip = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.22, 0.13), gripMat);
@@ -67,6 +77,7 @@ export class PistolItem extends Item {
     this.recoil = 0;
     this.flashT = 0;
     this.shots = 0;
+    this.aimK = 0; // 0 — в руке, 1 — полностью в прицеле
     this.onFireAt = null; // вызывается ровно один раз на выстрел
   }
 
@@ -99,10 +110,22 @@ export class PistolItem extends Item {
     this.slide.position.z = -0.07 + this.recoil * 0.07;
     this.slide.position.y = 0.09 + this.recoil * 0.005;
 
-    const pose = { ...this.base };
-    pose.py = this.base.py + this.recoil * 0.05;
-    pose.pz = this.base.pz + this.recoil * 0.09;
-    pose.rx = this.base.rx - this.recoil * c.recoil;
+    // ПКМ-прицел: поза плавно съезжает на aimBase — планки по центру экрана
+    const aimTarget = view.aim ? 1 : 0;
+    this.aimK += (aimTarget - this.aimK) * (1 - Math.exp(-c.aimSpeed * dt));
+    if (Math.abs(aimTarget - this.aimK) < 1e-3) this.aimK = aimTarget;
+    const k = this.aimK;
+    const b = this.base;
+    const a = this.aimBase;
+
+    const pose = {
+      px: b.px + (a.px - b.px) * k,
+      py: b.py + (a.py - b.py) * k + this.recoil * 0.05,
+      pz: b.pz + (a.pz - b.pz) * k + this.recoil * 0.09,
+      rx: b.rx + (a.rx - b.rx) * k - this.recoil * c.recoil,
+      ry: b.ry + (a.ry - b.ry) * k,
+      rz: b.rz + (a.rz - b.rz) * k,
+    };
     this.applyPose(dt, view, pose);
   }
 }
