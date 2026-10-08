@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>hard-graph</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+
+    /* Канвас рендерится в маленьком разрешении, CSS растягивает его на весь экран.
+       image-rendering: pixelated — жёсткий NEAREST-апскейл, никакого размытия. */
+    #game {
+      position: fixed; inset: 0;
+      width: 100vw; height: 100vh;
+      display: block;
+      image-rendering: pixelated;
+    }
+
+    #hud {
+      position: fixed; top: 8px; left: 8px;
+      font: 12px/1.5 Consolas, "Courier New", monospace;
+      color: #cfe3cf; text-shadow: 1px 1px 0 #000;
+      white-space: pre; pointer-events: none; user-select: none;
+    }
+
+    #crosshair {
+      position: fixed; left: 50%; top: 50%;
+      width: 4px; height: 4px; margin: -2px 0 0 -2px;
+      background: rgba(255, 255, 255, 0.85);
+      box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.6);
+      pointer-events: none;
+    }
+
+    #hint {
+      position: fixed; inset: 0;
+      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+      font: 14px/1.7 Consolas, "Courier New", monospace;
+      color: #e8e8e8; text-align: center;
+      background: rgba(10, 12, 14, 0.55);
+      text-shadow: 1px 1px 0 #000;
+      user-select: none; cursor: pointer;
+    }
+    #hint.hidden { display: none; }
+    #hint .title { font-size: 20px; letter-spacing: 2px; }
+    #hint .muted { color: #9aa4ae; }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <div id="crosshair"></div>
+  <pre id="hud"></pre>
+  <div id="hint">
+    <div class="title">HARD-GRAPH</div>
+    <div>Клик — захватить мышь и начать</div>
+    <div class="muted">WASD — движение · Shift — бег · C — присед · Пробел — прыжок</div>
+    <div class="muted">ЛКМ — применить предмет · 1/2 — палка/пистолет · колесо — следующее</div>
+    <div class="muted">V — разрешение · F3 — HUD · R — сброс манекенов · G — новый мир</div>
+  </div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
