@@ -31,6 +31,19 @@
       pointer-events: none;
     }
 
+    /* X-маркер попадания по NPC: вспышка в центре, плотность и масштаб задаёт main.js */
+    #hitmarker {
+      position: fixed; left: 50%; top: 50%; width: 0; height: 0;
+      pointer-events: none; opacity: 0;
+    }
+    #hitmarker::before, #hitmarker::after {
+      content: ''; position: absolute; left: -7px; top: -1.5px;
+      width: 14px; height: 3px;
+      background: #fff; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55);
+    }
+    #hitmarker::before { transform: rotate(45deg); }
+    #hitmarker::after { transform: rotate(-45deg); }
+
     /* Красный фильтр полученного урона: плотность задаёт main.js по остатку здоровья */
     #damage {
       position: fixed; inset: 0;
@@ -58,6 +71,7 @@
   <canvas id="game"></canvas>
   <div id="damage"></div>
   <div id="crosshair"></div>
+  <div id="hitmarker"></div>
   <pre id="hud"></pre>
   <div id="hint">
     <div class="title">HARD-GRAPH</div>

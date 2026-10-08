@@ -19,6 +19,20 @@ export class Impacts {
       this.units.push({ mesh, vel: new THREE.Vector3(), life: 0 });
     }
 
+    // Кровь при попадании по NPC: тот же пул-механизм, но красная и мельче —
+    // попадание по врагу читается мгновенно.
+    this.blood = [];
+    this.bloodNext = 0;
+    const bloodGeo = new THREE.BoxGeometry(0.045, 0.045, 0.045);
+    const bloodMat = new THREE.MeshBasicMaterial({ color: cfg.palette.blood });
+    for (let i = 0; i < this.cfg.bloodPool; i++) {
+      const mesh = new THREE.Mesh(bloodGeo, bloodMat);
+      mesh.visible = false;
+      this.group.add(mesh);
+      this.blood.push({ mesh, vel: new THREE.Vector3(), life: 0 });
+    }
+    this.pools = [this.units, this.blood]; // update гоняет обе одинаково
+
     // Яркие вспышки выстрелов NPC: светящийся кристалл, самого яркого цвета в палитре.
     // Материал без освещения — в тумане боя видно, откуда стреляют.
     this.flashes = [];
@@ -72,9 +86,38 @@ export class Impacts {
     }
   }
 
+  // Брызги крови в точке попадания по NPC: летят назад и вниз, живут коротко.
+  spawnBlood(point, dir) {
+    const c = this.cfg;
+    for (let i = 0; i < c.bloodSparks; i++) {
+      const u = this.blood[this.bloodNext];
+      this.bloodNext = (this.bloodNext + 1) % this.blood.length;
+
+      u.life = c.bloodLife * (0.6 + 0.4 * Math.random());
+      u.mesh.visible = true;
+      u.mesh.scale.setScalar(1);
+      u.mesh.position.set(
+        point.x + (Math.random() - 0.5) * 0.1,
+        point.y + (Math.random() - 0.5) * 0.1,
+        point.z + (Math.random() - 0.5) * 0.1,
+      );
+      u.vel.set(
+        -dir.x * c.speed * 0.7 * (0.4 + Math.random()) + (Math.random() - 0.5) * 1.6,
+        Math.random() * 1.5,
+        -dir.z * c.speed * 0.7 * (0.4 + Math.random()) + (Math.random() - 0.5) * 1.6,
+      );
+    }
+  }
+
   get activeCount() {
     let n = 0;
     for (const u of this.units) if (u.life > 0) n++;
+    return n;
+  }
+
+  get bloodCount() {
+    let n = 0;
+    for (const u of this.blood) if (u.life > 0) n++;
     return n;
   }
 
@@ -116,17 +159,19 @@ export class Impacts {
   }
 
   update(dt) {
-    for (const u of this.units) {
-      if (u.life <= 0) continue;
-      u.life -= dt;
-      if (u.life <= 0) {
-        u.mesh.visible = false;
-        continue;
+    for (const pool of this.pools) {
+      for (const u of pool) {
+        if (u.life <= 0) continue;
+        u.life -= dt;
+        if (u.life <= 0) {
+          u.mesh.visible = false;
+          continue;
+        }
+        u.vel.y -= this.cfg.gravity * dt;
+        u.mesh.position.addScaledVector(u.vel, dt);
+        const s = Math.max(0.3, u.life / this.cfg.life);
+        u.mesh.scale.setScalar(s);
       }
-      u.vel.y -= this.cfg.gravity * dt;
-      u.mesh.position.addScaledVector(u.vel, dt);
-      const s = Math.max(0.3, u.life / this.cfg.life);
-      u.mesh.scale.setScalar(s);
     }
     for (const f of this.flashes) {
       if (f.t <= 0) continue;

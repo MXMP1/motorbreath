@@ -46,5 +46,6 @@ export function createTerrain(heightmap, cfg) {
   const mat = new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true });
   const mesh = new THREE.Mesh(geo, mat);
   mesh.name = 'terrain';
+  mesh.receiveShadow = true; // земля принимает тени от костра лагеря
   return mesh;
 }

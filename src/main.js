@@ -23,6 +23,8 @@ import { Hud } from './core/hud.js';
 const canvas = document.getElementById('game');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
 renderer.setPixelRatio(1); // пиксели — это пиксели
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.BasicShadowMap; // тени рисует только костёр лагеря — минимальная карта
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(CONFIG.palette.sky);
@@ -42,6 +44,9 @@ controls.pointerSpeed = CONFIG.player.sens / 0.002;
 
 const hint = document.getElementById('hint');
 const damageEl = document.getElementById('damage'); // красный фильтр урона
+const hitmarkEl = document.getElementById('hitmarker'); // X в центре: попадание по NPC
+let hitmarkT = 0;
+function showHitmark() { hitmarkT = CONFIG.hud.hitMarkTime; }
 document.addEventListener('click', () => { if (!controls.isLocked) controls.lock(); });
 controls.addEventListener('lock', () => hint.classList.add('hidden'));
 controls.addEventListener('unlock', () => hint.classList.remove('hidden'));
@@ -141,7 +146,7 @@ function rebuildWorld(newSeed) {
   world.camp = new Camp(cfg, world); // лагерь напротив города: спавн, дружелюбные, постройки
   scene.add(world.camp.group);
   world.colliders.push(...world.camp.colliders);
-  world.npcs = new Npcs(layout.npcs, CONFIG, world, buildCovers(cfg, layout));
+  world.npcs = new Npcs(layout.npcs, CONFIG, world, buildCovers(cfg, layout, world.camp.coverBoxes));
   world.npcs.addTo(scene);
   return world;
 }
@@ -199,6 +204,7 @@ function hurt(amount, from) {
 
 const tmpDir = new THREE.Vector3();
 const tmpFlat = new THREE.Vector3();
+const tmpHit = new THREE.Vector3(); // точка кровяных брызг при ударе палкой
 const raycaster = new THREE.Raycaster();
 raycaster.far = CONFIG.pistol.range;
 const PISTOL_HIT = { damage: CONFIG.pistol.damage, knockback: CONFIG.pistol.knockback }; // импульс NPC от пули
@@ -227,7 +233,10 @@ function stickHit() {
     const dy = u.pos.y + 0.9 - cy;
     const dz = u.pos.z - cz;
     if (dx * dx + dy * dy + dz * dz < 1.35 * 1.35) {
-      world.npcs.hit(i, tmpFlat, CONFIG.stick, camera.position);
+      if (world.npcs.hit(i, tmpFlat, CONFIG.stick, camera.position)) {
+        impacts.spawnBlood(tmpHit.set(u.pos.x, u.pos.y + 0.95, u.pos.z), tmpFlat);
+        showHitmark();
+      }
     }
   }
 
@@ -269,6 +278,9 @@ function shoot() {
   );
   // свист пули рядом с NPC поднимает группу: идут искать место выстрела
   world.npcs.alertShot(camera.position, tmpDir, hits.length ? hits[0].distance : CONFIG.pistol.range);
+  // выстрел гремит: вся округа в радиусе noiseRadius идёт к месту выстрела.
+  // Палка не шумит — тихий путь существует, это стелс.
+  world.npcs.alertNoise(camera.position, CONFIG.pistol.noiseRadius);
   if (hits.length === 0) return;
   const hit = hits[0];
 
@@ -277,8 +289,10 @@ function shoot() {
   if (tmpFlat.lengthSq() < 1e-6) tmpFlat.set(0, 0, -1);
   tmpFlat.normalize();
 
+  let flesh = false; // попадание по живой цели: кровь и X-маркер — есть отдача от попадания
   if (hit.object.userData.npc && hit.instanceId !== undefined) {
     world.npcs.hit(hit.instanceId, tmpFlat, PISTOL_HIT, camera.position);
+    flesh = true;
   } else if ((hit.object === world.trees.trunks || hit.object === world.trees.crowns) && hit.instanceId !== undefined) {
     world.trees.hit(hit.instanceId);
   } else if (hit.object === world.bushes.mesh && hit.instanceId !== undefined) {
@@ -289,7 +303,12 @@ function shoot() {
     world.bins.hit(hit.instanceId, tmpFlat, CONFIG.street.binImpulse);
   }
 
-  impacts.spawn(hit.point, tmpDir);
+  if (flesh) {
+    impacts.spawnBlood(hit.point, tmpDir); // кровь: попадание читается сразу
+    showHitmark();
+  } else {
+    impacts.spawn(hit.point, tmpDir); // искры о мир: стена, камень, дерево
+  }
   pitchKick = CONFIG.pistol.pitchKick;
 }
 
@@ -316,7 +335,8 @@ const sizeVec = new THREE.Vector2();
 
 function step(dt) {
   player.update(dt, input);
-  world.npcs.update(dt, player.pos, npcHooks);
+  // присед игрока урезает дальность обнаружения — стелс
+  world.npcs.update(dt, player.pos, npcHooks, { crouch: player.crouching });
   world.camp.update(dt, player.pos); // головы дружелюбных следят за игроком вблизи
   world.bins.update(dt);
   pushBagsByBins(world.bags, world.bins, CONFIG.street.bagPush); // проехал ли бак по мешку
@@ -399,6 +419,16 @@ function frame() {
     damageEl.style.opacity = (dmgAlpha * (dmgT / CONFIG.player.hurt.time)).toFixed(3);
   } else if (damageEl.style.opacity !== '0') {
     damageEl.style.opacity = '0';
+  }
+
+  // X-маркер попадания: вспыхивает в центре и быстро гаснет
+  if (hitmarkT > 0) {
+    hitmarkT = Math.max(0, hitmarkT - dt);
+    const k = hitmarkT / CONFIG.hud.hitMarkTime;
+    hitmarkEl.style.opacity = k.toFixed(2);
+    hitmarkEl.style.transform = `scale(${(1.6 - 0.6 * k).toFixed(2)})`;
+  } else if (hitmarkEl.style.opacity !== '0') {
+    hitmarkEl.style.opacity = '0';
   }
 
   renderer.getSize(sizeVec);

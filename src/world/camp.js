@@ -6,9 +6,10 @@ const UP = new THREE.Vector3(0, 1, 0);
 const ONE = new THREE.Vector3(1, 1, 1);
 const HEAD_STAND = 1.66; // центр головы стоящего — как у городских NPC
 const HEAD_SIT = 1.18;   // голова сидящего на земле
-const TENT_HALF = 1.55;  // половина ширины палатки до гребня, м
-const TENT_TOP = 1.62;   // высота гребня палатки, м
-const TENT_DEPTH = 2.9;  // глубина палатки, м
+const TENT_HALF = 2.1;   // половина ширины палатки до гребня, м (внутри — стол и друг)
+const TENT_TOP = 2.3;    // высота гребня палатки, м: стоящий человек помещается
+const TENT_DEPTH = 4.2;  // глубина палатки, м
+const TENT_WALL = 0.55;  // ширина коллайдера-стены вдоль ската: середина прохода открыта
 const HEAD_TURN = 2.2;   // насколько голова отворачивается от тела, рад
 
 // Лагерь на стороне карты напротив города: палатка, кострище и вешалки с бельём.
@@ -18,33 +19,43 @@ const HEAD_TURN = 2.2;   // насколько голова отворачива
 export class Camp {
   constructor(cfg, world) {
     this.cfg = cfg.camp;
+    this.city = cfg.city; // городской друг стоит в центре города — элемент задания
     this.palette = cfg.palette;
     this.world = world; // нужна карта высот: все объекты лагеря садятся на рельеф
     this.group = new THREE.Group();
     this.colliders = []; // палатка, столбы и полоса белья — сквозь них не пройти
     this.friends = [];   // дружелюбные: позиция, поза и угол головы
+    this.coverBoxes = []; // коробки для грида укрытий: сквозь палатку NPC не видит игрока
 
     this._q = new THREE.Quaternion();
     this._p = new THREE.Vector3();
     this._m = new THREE.Matrix4();
+    this._t = 0; // время для огня: пламя и свет костра ходят по синусам
 
     this._buildTent();
     this._buildCampfire();
     this._buildRacks();
     this._buildFriends();
+
+    // тени от костра: их рисуют только объекты лагеря — дёшево и читаемо у огня
+    if (this.cfg.fireShadows) this.group.traverse((o) => { if (o.isMesh) o.castShadow = true; });
+    this.group.traverse((o) => { if (o.isMesh) o.receiveShadow = true; });
+    for (const m of this.flame.children) m.castShadow = false; // само пламя тень не бросает
   }
 
   _groundAt(x, z) {
-    return this.world.heightmap.heightAt(x, z);
+    const lift = this.world.cityLift ? this.world.cityLift(x, z) : 0; // горожанин — на покрытии
+    return this.world.heightmap.heightAt(x, z) + lift;
   }
 
   // Палатка: два ската и задняя стенка-треугольник, вход смотрит в лагерь.
+  // Внутри — стол у задней стенки; вход открыт, внутрь можно зайти.
   _buildTent() {
     const c = this.cfg;
     const x = c.x + 2;
     const z = c.z - 7;
     const gy = this._groundAt(x, z);
-    this.tent = { x, z, gy };
+    this.tent = { x, z, gy, half: TENT_HALF, top: TENT_TOP, depth: TENT_DEPTH };
 
     const mat = new THREE.MeshLambertMaterial({ color: this.palette.tent, flatShading: true });
     const slope = Math.hypot(TENT_HALF, TENT_TOP);
@@ -72,10 +83,45 @@ export class Camp {
     back.position.set(x, gy, z - TENT_DEPTH / 2);
     this.group.add(back);
 
+    // стены-коллайдеры вдоль скатов и задник: вход с юга открыт, внутрь можно войти
+    const half = TENT_DEPTH / 2;
+    this.colliders.push({
+      minX: x - TENT_HALF - 0.12, maxX: x - TENT_HALF + TENT_WALL,
+      minZ: z - half - 0.1, maxZ: z + half + 0.1,
+      minY: gy - 0.5, maxY: gy + TENT_TOP,
+    });
+    this.colliders.push({
+      minX: x + TENT_HALF - TENT_WALL, maxX: x + TENT_HALF + 0.12,
+      minZ: z - half - 0.1, maxZ: z + half + 0.1,
+      minY: gy - 0.5, maxY: gy + TENT_TOP,
+    });
     this.colliders.push({
       minX: x - TENT_HALF - 0.12, maxX: x + TENT_HALF + 0.12,
-      minZ: z - TENT_DEPTH / 2 - 0.1, maxZ: z + TENT_DEPTH / 2 + 0.1,
+      minZ: z - half - 0.1, maxZ: z - half + 0.45,
       minY: gy - 0.5, maxY: gy + TENT_TOP,
+    });
+    // сквозь палатку враждебные не видят игрока — как сквозь дом
+    this.coverBoxes.push({
+      minX: x - TENT_HALF - 0.12, maxX: x + TENT_HALF + 0.12,
+      minZ: z - half - 0.1, maxZ: z + half + 0.1,
+    });
+
+    // стол в дальней части палатки: за ним сидит пятый друг, лицом к входу
+    const table = [];
+    const top = new THREE.BoxGeometry(1.5, 0.06, 0.7);
+    top.translate(x, gy + 0.52, z - 0.55);
+    table.push(top);
+    for (const dx of [-0.62, 0.62]) {
+      const leg = new THREE.BoxGeometry(0.12, 0.52, 0.6);
+      leg.translate(x + dx, gy + 0.26, z - 0.55);
+      table.push(leg);
+    }
+    this.group.add(new THREE.Mesh(mergeGeometries(table),
+      new THREE.MeshLambertMaterial({ color: this.palette.trunk, flatShading: true })));
+    this.colliders.push({ // стол тоже не пропускает: сидящий — за ним, ноги под столешницей
+      minX: x - 0.78, maxX: x + 0.78,
+      minZ: z - 0.95, maxZ: z - 0.15,
+      minY: gy - 0.5, maxY: gy + 0.6,
     });
   }
 
@@ -125,6 +171,33 @@ export class Camp {
     }
     this.group.add(new THREE.Mesh(mergeGeometries(logs),
       new THREE.MeshLambertMaterial({ color: this.palette.trunk, flatShading: true })));
+
+    // пламя: три кубика — в update «дышат» по синусам; дёшево и живо
+    this.flame = new THREE.Group();
+    const flameMat = new THREE.MeshBasicMaterial({ color: this.palette.fire });
+    const coreMat = new THREE.MeshBasicMaterial({ color: this.palette.fireCore });
+    const big = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.38, 0.3), flameMat);
+    const side1 = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.22, 0.16), coreMat);
+    side1.position.set(-0.16, -0.06, 0.1);
+    const side2 = new THREE.Mesh(new THREE.BoxGeometry(0.13, 0.18, 0.13), coreMat);
+    side2.position.set(0.15, -0.08, -0.09);
+    this.flame.add(big, side1, side2);
+    this._fireBase = gy + 0.35;
+    this.flame.position.set(x, this._fireBase, z);
+    this.group.add(this.flame);
+
+    // свет костра: тёплый, мерцает; тени (по кнобу fireShadows) рисуют только
+    // объекты лагеря — минимальная карта 256, пиксельный BasicShadowMap
+    this.fireLight = new THREE.PointLight(this.palette.fire, c.fireLight, 14, 2);
+    this.fireLight.position.set(x, gy + 1.05, z);
+    if (c.fireShadows) {
+      this.fireLight.castShadow = true;
+      this.fireLight.shadow.mapSize.set(256, 256);
+      this.fireLight.shadow.camera.near = 0.3;
+      this.fireLight.shadow.camera.far = 14;
+      this.fireLight.shadow.bias = -0.004;
+    }
+    this.group.add(this.fireLight);
   }
 
   // Вешалки с бельём: две стойки с перекладиной и три тряпки вразнобой.
@@ -176,15 +249,18 @@ export class Camp {
     const c = this.cfg;
     const fx = c.x - 2; // ориентир взгляда в покое — костёр
     const fz = c.z + 2;
+    const t = this.tent;
     const list = [
-      { x: c.x + 3.6, z: c.z - 5.2, sit: true },  // у входа в палатку
-      { x: c.x - 3.3, z: c.z + 1.1, sit: true },  // у костра слева
-      { x: c.x - 0.6, z: c.z + 3.3, sit: true },  // у костра справа
-      { x: c.x + 3.8, z: c.z + 4.7, sit: false }, // у вешалок
+      { x: c.x + 3.2, z: c.z - 3.8, sit: true },           // у входа в палатку
+      { x: c.x - 3.3, z: c.z + 1.1, sit: true },           // у костра слева
+      { x: c.x - 0.6, z: c.z + 3.3, sit: true },           // у костра справа
+      { x: c.x + 3.8, z: c.z + 4.7, sit: false },          // у вешалок
+      { x: t.x, z: t.z - 1.35, sit: true, yaw: 0 },        // в палатке за столом, лицом к входу
+      { x: this.city.cx, z: this.city.cz, sit: false, yaw: Math.PI / 2 }, // в центре города: элемент задания
     ];
     for (const f of list) {
       f.y = this._groundAt(f.x, f.z);
-      f.yaw = Math.atan2(fx - f.x, fz - f.z); // в покое смотрят на костёр
+      if (f.yaw === undefined) f.yaw = Math.atan2(fx - f.x, fz - f.z); // в покое смотрят на костёр
       f.headYaw = 0; // доворот головы к игроку поверх поворота тела
       f.headY = f.sit ? HEAD_SIT : HEAD_STAND;
     }
@@ -230,6 +306,21 @@ export class Camp {
   // Игрок рядом — головы поворачиваются на него; ушёл — возвращаются к костру.
   update(dt, p) {
     const c = this.cfg;
+    this._t += dt;
+
+    // огонь: пламя дрожит, свет мерцает — детерминированно, без rng
+    const t = this._t;
+    this.flame.position.y = this._fireBase + 0.05 * Math.sin(t * 9.1) + 0.02 * Math.sin(t * 23.7);
+    const fc = this.flame.children;
+    fc[0].scale.set(
+      1 + 0.16 * Math.sin(t * 13.7),
+      1 + 0.28 * Math.sin(t * 11.3 + 1.2),
+      1 + 0.16 * Math.sin(t * 12.1 + 2.1),
+    );
+    fc[1].scale.y = 1 + 0.5 * Math.sin(t * 17.3 + 0.7);
+    fc[2].scale.y = 1 + 0.5 * Math.sin(t * 19.1 + 2.8);
+    this.fireLight.intensity = c.fireLight * (0.95 + 0.22 * Math.sin(t * 15.3) * Math.sin(t * 7.7 + 1.3));
+
     const k = 1 - Math.exp(-c.lookSpeed * dt);
     for (const f of this.friends) {
       const dx = p.x - f.x;

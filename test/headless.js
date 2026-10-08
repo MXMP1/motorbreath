@@ -228,12 +228,20 @@ check('без ПКМ пистолет возвращается в руку', Mat
 // искры от попаданий
 const imp = new Impacts(CONFIG);
 check('пул искр, вспышек и следов создан и спит',
-  imp.group.children.length === CONFIG.impacts.pool + CONFIG.impacts.flashPool + CONFIG.impacts.tracerPool &&
+  imp.group.children.length === CONFIG.impacts.pool + CONFIG.impacts.bloodPool +
+    CONFIG.impacts.flashPool + CONFIG.impacts.tracerPool &&
   imp.activeCount === 0);
 imp.spawn(new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0, -1));
 check('попадание рождает искры', imp.activeCount === CONFIG.impacts.sparks, `active=${imp.activeCount}`);
 for (let i = 0; i < 120; i++) imp.update(1 / 120);
 check('искры догорают за life', imp.activeCount === 0);
+
+// кровь при попадании по NPC: красные брызги живут коротко
+check('кровавые брызги спят на старте', imp.bloodCount === 0);
+imp.spawnBlood(new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0, -1));
+check('попадание по NPC рождает кровь', imp.bloodCount === CONFIG.impacts.bloodSparks, `blood=${imp.bloodCount}`);
+for (let i = 0; i < 120; i++) imp.update(1 / 120);
+check('брызги догорают за bloodLife', imp.bloodCount === 0);
 
 // вспышки выстрелов NPC: ярко вспыхивают и гаснут быстро
 check('вспышки спят на старте', imp.flashCount === 0);
@@ -545,6 +553,37 @@ const deaf = new Npcs([
 deaf.alertShot({ x: 100, y: 20, z: 100 }, { x: 0, y: 0, z: 1 }, 20);
 check('далёкий выстрел никого не поднимает', deaf.alertCount === 0);
 
+// громкий выстрел: слышно в большом радиусе — все в круге идут к месту выстрела
+const noise = new Npcs([
+  { x: 0, z: 0, y: 0, rot: 0, weapon: 'stick', home: { x: 0, z: 0 } },    // в 10 м от выстрела
+  { x: 0, z: 24, y: 0, rot: 0, weapon: 'pistol', home: { x: 0, z: 24 } },  // в 14 м: тоже слышит
+  { x: 0, z: 46, y: 0, rot: 0, weapon: 'stick', home: { x: 0, z: 46 } },   // 36 м: глухой
+], CONFIG, npcWorld, emptyCovers);
+noise.alertNoise({ x: 0, y: hm.heightAt(0, 0) + 1, z: 10 }, CONFIG.pistol.noiseRadius);
+check('громкий выстрел поднимает всю округу в радиусе шума', noise.alertCount === 2, `alert=${noise.alertCount}`);
+check('за радиусом шума выстрела не слышно', !noise.units[2].aware);
+
+// присед: игрока замечают со значительно меньшей дистанции — стелс
+const crouchHard = mkHooks();
+const crouchSpotter = new Npcs([
+  { x: 0, z: 0, y: 0, rot: 0, weapon: 'stick', home: { x: 0, z: 0 } },
+], CONFIG, npcWorld, emptyCovers);
+const crouchFar = new THREE.Vector3(0, 0, 24); // 24 м: < полного зрения 28, > приседного
+for (let i = 0; i < 600; i++) crouchSpotter.update(1 / 60, crouchFar, crouchHard.hooks);
+check('стоящего игрока видят с 24 м', crouchSpotter.alertCount === 1, `alert=${crouchSpotter.alertCount}`);
+const crouchSoft = mkHooks();
+const crouchHider = new Npcs([
+  { x: 0, z: 0, y: 0, rot: 0, weapon: 'stick', home: { x: 0, z: 0 } },
+], CONFIG, npcWorld, emptyCovers);
+for (let i = 0; i < 600; i++) crouchHider.update(1 / 60, crouchFar, crouchSoft.hooks, { crouch: true });
+check('присевшего с 24 м не замечают (стелс)', crouchHider.alertCount === 0, `alert=${crouchHider.alertCount}`);
+const crouchNear = mkHooks();
+const crouchWatcher = new Npcs([
+  { x: 0, z: 0, y: 0, rot: 0, weapon: 'stick', home: { x: 0, z: 0 } },
+], CONFIG, npcWorld, emptyCovers);
+for (let i = 0; i < 600; i++) crouchWatcher.update(1 / 60, new THREE.Vector3(0, 0, 8), crouchNear.hooks, { crouch: true });
+check('в упор присевшего всё равно видят', crouchWatcher.alertCount === 1, `alert=${crouchWatcher.alertCount}`);
+
 // новый выстрел перенацеливает уже разбуженную группу (а не только спящих)
 const squad2 = new Npcs([
   { x: 0, z: 0, y: 0, rot: 0, weapon: 'stick', home: { x: 0, z: 0 } },
@@ -603,14 +642,55 @@ check('патруль не выходит из города', npcsView.units.eve
 
 // ---------- H. Лагерь ----------
 console.log('\nH. Лагерь');
-const camp = new Camp(CONFIG, { heightmap: hm });
-check('лагерь собран: постройки и четверо дружелюбных',
-  camp.group.children.length > 10 && camp.friends.length === 4 && camp.colliders.length >= 3);
-const tentTry = resolveCircleAabb(camp.tent.x, camp.tent.z, 0.4, camp.tent.gy + 0.5, 1.8, camp.colliders);
-check('палатка не пропускает сквозь себя', tentTry.hit);
+const camp = new Camp(CONFIG, { heightmap: hm, cityLift: null });
+check('лагерь собран: постройки и шесть дружелюбных',
+  camp.group.children.length > 10 && camp.friends.length === 6 && camp.colliders.length >= 6);
+const tentWallTry = resolveCircleAabb(camp.tent.x - camp.tent.half + 0.25, camp.tent.z,
+  0.4, camp.tent.gy + 0.5, 1.8, camp.colliders);
+check('стена палатки не пропускает сквозь себя', tentWallTry.hit);
+const tentDoorTry = resolveCircleAabb(camp.tent.x, camp.tent.z + camp.tent.depth / 2 - 0.3,
+  0.4, camp.tent.gy + 0.5, 1.8, camp.colliders);
+check('вход в палатку открыт — внутрь можно зайти', !tentDoorTry.hit);
+const fTent = camp.friends[4];
+const fTentTry = resolveCircleAabb(fTent.x, fTent.z, 0.25, fTent.y, 1.2, camp.colliders);
+check('друг за столом в палатке стоит свободно', !fTentTry.hit);
 const spawnTry = resolveCircleAabb(CONFIG.camp.x + CONFIG.camp.spawnDx, CONFIG.camp.z + CONFIG.camp.spawnDz,
   0.4, hm.heightAt(CONFIG.camp.x + CONFIG.camp.spawnDx, CONFIG.camp.z + CONFIG.camp.spawnDz), 1.8, camp.colliders);
 check('спавн игрока не торчит в постройках', !spawnTry.hit);
+
+// костёр: пламя живёт, свет мерцает, тени — по кнобу fireShadows
+check('костёр горит: пламя из трёх кубиков и тёплый свет',
+  camp.flame.children.length === 3 && camp.fireLight.intensity > 0.5);
+check('тени костра — минимальная карта, по кнобу fireShadows',
+  camp.fireLight.castShadow === CONFIG.camp.fireShadows && camp.fireLight.shadow.mapSize.x === 256);
+const fireI0 = camp.fireLight.intensity;
+const fireY0 = camp.flame.position.y;
+const awayVec = new THREE.Vector3(999, 0, 999);
+for (let i = 0; i < 30; i++) camp.update(1 / 60, awayVec);
+check('пламя дрожит, свет мерцает во времени',
+  camp.fireLight.intensity !== fireI0 && camp.flame.position.y !== fireY0,
+  `I=${camp.fireLight.intensity.toFixed(2)}`);
+
+// городской друг: центр города, не в доме, стоит на покрытии
+const campCity = new Camp(CONFIG, { heightmap: hm, cityLift });
+const fCity = campCity.friends[5];
+check('городской друг стоит в центре города и не в доме',
+  Math.abs(fCity.x - cfg.city.cx) < 1e-6 && Math.abs(fCity.z - cfg.city.cz) < 1e-6 &&
+  !inBuilding(fCity.x, fCity.z, 1),
+  `x=${fCity.x.toFixed(1)} z=${fCity.z.toFixed(1)}`);
+check('городской друг стоит на покрытии города',
+  Math.abs(fCity.y - (hm.heightAt(fCity.x, fCity.z) + cityLift(fCity.x, fCity.z))) < 1e-6);
+
+// палатка в гриде укрытий: сквозь неё враждебные не видят игрока
+const tentCovers = buildCovers(cfg, { buildings: [], rocks: [], trees: [], city: null }, camp.coverBoxes);
+const tentGuard = new Npcs([
+  { x: camp.tent.x, z: camp.tent.z - 6, y: 0, rot: 0, weapon: 'stick', home: { x: camp.tent.x, z: camp.tent.z - 6 } },
+], CONFIG, npcWorld, tentCovers);
+check('палатка блокирует линию взгляда NPC (как дом)',
+  !tentGuard._los(camp.tent.x, camp.tent.z - 6, camp.tent.x, camp.tent.z + 6));
+check('рядом с палаткой линия взгляда свободна',
+  tentGuard._los(camp.tent.x + 8, camp.tent.z - 6, camp.tent.x + 8, camp.tent.z + 6));
+
 const f0 = camp.friends[0];
 const nearCamp = new THREE.Vector3(f0.x + 3, 0, f0.z + 3);
 for (let i = 0; i < 300; i++) camp.update(1 / 60, nearCamp);

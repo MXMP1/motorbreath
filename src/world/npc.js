@@ -64,6 +64,8 @@ export class Npcs {
 
     let wiStick = 0;
     let wiGun = 0;
+    const headCol = new THREE.Color(cfg.palette.npcHead);
+    this._hc = headCol; // свой цвет головы — вернуть после вспышки попадания
     list.forEach((it, i) => {
       const u = {
         pos: new THREE.Vector3(it.x, it.y !== undefined ? it.y : this.groundAt(it.x, it.z), it.z),
@@ -95,14 +97,18 @@ export class Npcs {
         aimT: 0,
         gunT: 0,
         burstLeft: 0, // выстрелов осталось в текущей очереди
+        flashT: 0,    // белая вспышка куртки от попадания игрока
       };
       u.wi = u.weapon === 'pistol' ? wiGun++ : wiStick++;
       this.units.push(u);
 
       this._c.set(cfg.palette.npcBody).multiplyScalar(0.8 + this.rng() * 0.45); // у каждого свой оттенок куртки
       this.body.setColorAt(i, this._c);
+      u.col = this._c.clone(); // свой цвет — вернуть после вспышки попадания
+      this.head.setColorAt(i, headCol);
     });
     if (this.body.instanceColor) this.body.instanceColor.needsUpdate = true;
+    if (this.head.instanceColor) this.head.instanceColor.needsUpdate = true;
 
     for (let i = 0; i < this.units.length; i++) this._compose(i);
     for (const m of this.parts) m.instanceMatrix.needsUpdate = true;
@@ -135,6 +141,13 @@ export class Npcs {
     if (!u || u.dead) return false;
     u.vel.x += dir.x * (imp.knockback || 0);
     u.vel.z += dir.z * (imp.knockback || 0);
+    // белая вспышка куртки и головы: попадание видно сразу, даже боковым зрением
+    u.flashT = this.cfg.hitFlashTime;
+    this._c.set(0xffffff);
+    this.body.setColorAt(i, this._c);
+    this.head.setColorAt(i, this._c);
+    this.body.instanceColor.needsUpdate = true;
+    this.head.instanceColor.needsUpdate = true;
     u.aware = true;
     if (fromPos) u.lastKnown = { x: fromPos.x, z: fromPos.z };
     u.hp -= imp.damage || 0;
@@ -183,6 +196,19 @@ export class Npcs {
     }
   }
 
+  // Громкий выстрел: NPC в радиусе слышат хлопок и идут к месту выстрела
+  // (позиция игрока). Палка не шумит — тихий путь существует, это стелс.
+  alertNoise(from, radius) {
+    const r2 = radius * radius;
+    for (const u of this.units) {
+      if (u.dead || u.sees) continue; // в бою цель не сбиваем
+      const dx = u.pos.x - from.x;
+      const dz = u.pos.z - from.z;
+      if (dx * dx + dz * dz > r2) continue;
+      this._alert(u, from);
+    }
+  }
+
   // Поднять по тревоге: место выстрела — последняя известная точка, дальше обычный поиск.
   _alert(u, from) {
     u.aware = true;
@@ -193,10 +219,12 @@ export class Npcs {
     u.pauseT = 0;
   }
 
-  update(dt, playerPos, hooks) {
+  update(dt, playerPos, hooks, opts) {
     const onDamage = (hooks && hooks.playerDamage) || noop;
     const onMuzzle = (hooks && hooks.muzzle) || noop;
     const onTracer = (hooks && hooks.tracer) || noop;
+    // присевшего игрока замечают со значительно меньшей дистанции — стелс
+    const vision = this.cfg.visionRange * (opts && opts.crouch ? this.cfg.crouchVision : 1);
     for (const u of this.units) {
       if (u.dead) {
         u.fall = Math.min(1, u.fall + dt / FALL_TIME); // заваливается и остаётся лежать
@@ -204,11 +232,27 @@ export class Npcs {
       }
       u.thinkT -= dt;
       if (u.thinkT <= 0) {
-        this._think(u, playerPos);
+        this._think(u, playerPos, vision);
         u.thinkT = this.cfg.thinkInterval * (0.75 + this.rng() * 0.5); // решения вразнобой
       }
       this._move(u, dt, playerPos);
       this._act(u, dt, playerPos, onDamage, onMuzzle, onTracer);
+    }
+    // вспышка попадания гаснет: куртка и голова возвращают свои оттенки
+    let colDirty = false;
+    for (let i = 0; i < this.units.length; i++) {
+      const u = this.units[i];
+      if (u.flashT <= 0) continue;
+      u.flashT -= dt;
+      if (u.flashT <= 0) {
+        this.body.setColorAt(i, u.col);
+        this.head.setColorAt(i, this._hc);
+        colDirty = true;
+      }
+    }
+    if (colDirty) {
+      this.body.instanceColor.needsUpdate = true;
+      this.head.instanceColor.needsUpdate = true;
     }
     this._separate();
     for (let i = 0; i < this.units.length; i++) this._compose(i);
@@ -216,10 +260,11 @@ export class Npcs {
   }
 
   // Решение по зонам контакта; вызывается раз в thinkInterval.
-  _think(u, p) {
+  // vision — уже урезанная дальность (присед игрока), а не полная из конфига.
+  _think(u, p, vision) {
     const c = this.cfg;
     const dist = Math.hypot(p.x - u.pos.x, p.z - u.pos.z);
-    const visible = dist <= c.visionRange && this._los(u.pos.x, u.pos.z, p.x, p.z);
+    const visible = dist <= vision && this._los(u.pos.x, u.pos.z, p.x, p.z);
     u.sees = visible;
     if (visible) {
       u.aware = true;
@@ -280,7 +325,7 @@ export class Npcs {
     // вне видимости: контакт уже был — стрелки выглядывают, остальные ищут игрока
     u.state = 'search';
     const hide = u.cover ? Math.hypot(u.cover.x - u.pos.x, u.cover.z - u.pos.z) : Infinity;
-    if (u.weapon === 'pistol' && u.cover && dist <= c.visionRange && u.shotT <= 0) {
+    if (u.weapon === 'pistol' && u.cover && dist <= vision && u.shotT <= 0) {
       // уже выглядываем: держим курс на уголок, пока он видит игрока — бросок
       // к углу не должен срываться на полпути из-за отрыва от укрытия
       if (u.peek && this._los(u.peek.x, u.peek.z, p.x, p.z)) {
@@ -729,7 +774,11 @@ export class Npcs {
 
   // Вернуть всех на исходные позиции в полном здравии (клавиша R).
   resetAll() {
-    for (const u of this.units) {
+    for (let i = 0; i < this.units.length; i++) {
+      const u = this.units[i];
+      u.flashT = 0;
+      this.body.setColorAt(i, u.col); // погасить случайную вспышку попадания
+      this.head.setColorAt(i, this._hc);
       u.pos.set(u.home.x, this.groundAt(u.home.x, u.home.z), u.home.z);
       u.vel.set(0, 0, 0);
       u.yaw = u.rot;
@@ -758,13 +807,16 @@ export class Npcs {
     }
     for (let i = 0; i < this.units.length; i++) this._compose(i);
     for (const m of this.parts) m.instanceMatrix.needsUpdate = true;
+    if (this.body.instanceColor) this.body.instanceColor.needsUpdate = true;
+    if (this.head.instanceColor) this.head.instanceColor.needsUpdate = true;
   }
 }
 
 // Собрать укрытия и стены в хеш-грид: дома (прямоугольники), крупные валуны и
 // стволы деревьев (круги). По гриду NPC проверяет видимость, ищет укрытие и
-// обходит препятствия. Чистая геометрия — гоняется headless-тестом.
-export function buildCovers(cfg, layout) {
+// обходит препятствия. extra — готовые коробки не из layout (палатка лагеря).
+// Чистая геометрия — гоняется headless-тестом.
+export function buildCovers(cfg, layout, extra = []) {
   const cell = 8;
   const grid = new Map();
   for (const b of layout.buildings) {
@@ -778,6 +830,14 @@ export function buildCovers(cfg, layout) {
   for (const t of layout.trees) {
     const r = 0.3 * t.s; // крона высоко — взгляду мешает только ствол
     insertObstacle(grid, { rect: false, x: t.x, z: t.z, e1: r, e2: r }, cell);
+  }
+  // коробки построек вне layout (палатка лагеря): сквозь них NPC тоже не видит
+  for (const b of extra) {
+    insertObstacle(grid, {
+      rect: true,
+      x: (b.minX + b.maxX) / 2, z: (b.minZ + b.maxZ) / 2,
+      e1: (b.maxX - b.minX) / 2, e2: (b.maxZ - b.minZ) / 2,
+    }, cell);
   }
   return { grid, cell, city: layout.city ? { ...layout.city } : null };
 }
