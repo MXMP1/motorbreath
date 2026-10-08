@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { resolveCircleAabb } from '../core/collide.js';
-import { mergeGeometries } from './merge.js';
+import { mergeGeometries } from '../core/merge.js';
 
 // Мотоцикл: кинематический, без физического движка — те же приёмы, что у игрока
 // и NPC: выталкивание круга из коробок плюс высота рельефа. Нос — локальный +z,
@@ -27,6 +27,10 @@ export class Motorcycle {
     this._spin = 0;      // накопленный оборот колёс
     this._lean = 0;      // крен в повороте
     this._steerVis = 0;  // видимый поворот руля
+    this.crashEvent = null; // удар об препятствие за этот тик: читает main.js
+    this._wobT = 0;      // остаток тряски после удара, с
+    this._wobAmp = 0;    // амплитуда тряски, рад
+    this._wobPhase = 0;  // фаза синуса тряски
 
     // корпус — коллайдер для игрока и NPC; себе свои же коробки не мешают
     this.collider = { minX: 0, maxX: 0, minZ: 0, maxZ: 0, minY: 0, maxY: 1.05 };
@@ -117,6 +121,58 @@ export class Motorcycle {
     this.gear = 0;  // заглох на первой
   }
 
+  // Авария: водитель вылетел из седла. В отличие от dismount() скорость сохраняем —
+  // мотоцикл откатывается от стены и гаснет сам (ветка «без водителя» в update).
+  ejectRider() {
+    this.mounted = false;
+    this.gear = 0;
+  }
+
+  // Удар об препятствие: отражаем скорость от нормали стены.
+  // nx/nz — куда мотоцикл собирался шагнуть; res — куда его вытолкнул коллайдер.
+  _crash(nx, nz, res) {
+    const c = this.cfg.crash;
+    const speed = this.speed;
+    // нормаль — от точки выталкивания: куда нас вытолкнули, оттуда и стена
+    let ax = res.x - nx;
+    let az = res.z - nz;
+    let len = Math.hypot(ax, az);
+    if (len < 1e-6) { // выродилось: встали ровно в углу — бьём против носа
+      ax = -Math.sin(this.yaw);
+      az = -Math.cos(this.yaw);
+      len = 1;
+    }
+    const ux = ax / len;
+    const uz = az / len;
+    const vx = Math.sin(this.yaw) * speed;
+    const vz = Math.cos(this.yaw) * speed;
+    const impact = -(vx * ux + vz * uz); // плюс — ехали в стену
+
+    // слабое касание: никакого отскока, просто теряем ход
+    if (impact <= c.minImpact) {
+      this.speed *= 0.9;
+      return { impact, speed, nx: ux, nz: uz, eject: false };
+    }
+
+    // нормальную составляющую отражаем с упругостью, касательную — приглушаем
+    const vn = vx * ux + vz * uz;
+    const tx = vx - vn * ux;
+    const tz = vz - vn * uz;
+    const rvx = -vn * c.restitution * ux + tx * c.tangentKeep;
+    const rvz = -vn * c.restitution * uz + tz * c.tangentKeep;
+
+    // новая скорость — проекция отскока на нос (мотоцикл едет только вдоль курса)
+    const fx = Math.sin(this.yaw);
+    const fz = Math.cos(this.yaw);
+    const fwd = rvx * fx + rvz * fz;
+    const cross = rvx * fz - rvz * fx; // боковая составляющая отскока
+    this.speed = fwd;
+    this.yaw += c.yawKick * Math.atan2(cross, Math.abs(fwd)); // нос доворачивает вбок
+    this._wobT = c.wobbleTime;
+    this._wobAmp = Math.min(c.wobbleLean, impact * 0.02);
+    return { impact, speed, nx: ux, nz: uz, eject: impact >= c.ejectSpeed };
+  }
+
   // Свет фары: L гоняет по кругу выкл → ближний → дальний → выкл.
   toggleLight() {
     this.lightMode = (this.lightMode + 1) % 3;
@@ -145,12 +201,21 @@ export class Motorcycle {
     this._spin = 0;
     this._lean = 0;
     this._steerVis = 0;
+    this.crashEvent = null;
+    this._wobT = 0;
+    this._wobAmp = 0;
+    this._wobPhase = 0;
     this.sync();
   }
 
   sync() {
     this.group.position.copy(this.pos);
-    this.group.rotation.set(0, this.yaw, this._lean); // крен — вокруг собственного носа
+    // крен — вокруг собственного носа; поверх него тряска после удара (затухает)
+    const c = this.cfg.crash;
+    const wob = this._wobT > 0
+      ? Math.sin(this._wobPhase) * this._wobAmp * (this._wobT / c.wobbleTime)
+      : 0;
+    this.group.rotation.set(0, this.yaw, this._lean + wob);
     this.wheelFront.rotation.x = this._spin;
     this.wheelRear.rotation.x = this._spin;
     this.steerGroup.rotation.y = this._steerVis;
@@ -204,7 +269,12 @@ export class Motorcycle {
     const res = resolveCircleAabb(nx, nz, c.radius, this.pos.y, 1.0, this._solids);
     this.pos.x = res.x;
     this.pos.z = res.z;
-    if (res.hit) this.speed *= 0.15; // ткнулся в стену — глохнет
+    this.crashEvent = res.hit ? this._crash(nx, nz, res) : null;
+    if (this._wobT > 0) { // тряска: фаза растёт, амплитуда гаснет со временем
+      this._wobT = Math.max(0, this._wobT - dt);
+      this._wobPhase += dt * 40;
+      if (this._wobT === 0) this._wobPhase = 0;
+    }
     const limX = this.world.sizeX / 2 - 3;
     const limZ = this.world.sizeZ / 2 - 3;
     this.pos.x = Math.max(-limX, Math.min(limX, this.pos.x));

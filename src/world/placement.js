@@ -323,7 +323,6 @@ export function buildLayout(cfg) {
   return {
     heightmap, city: cityRect,
     buildings, trees, bushes, rocks, npcs, signs, bins, bags,
-    spawn: { x: 0, z: 0 },
   };
 }
 

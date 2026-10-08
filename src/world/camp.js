@@ -1,27 +1,15 @@
 import * as THREE from 'three';
-import { mergeGeometries } from './merge.js';
-import { resolveCircleAabb } from '../core/collide.js';
-import { SHELL, makeBodyGeometry } from './npc.js';
+import { mergeGeometries } from '../core/merge.js';
+import { Friends } from './friends.js';
 
-const UP = new THREE.Vector3(0, 1, 0);
-const ONE = new THREE.Vector3(1, 1, 1);
-const HEAD_STAND = 1.66; // центр головы стоящего — как у городских NPC
-const HEAD_SIT = 1.18;   // голова сидящего на земле
 const TENT_HALF = 2.1;   // половина ширины палатки до гребня, м (внутри — стол и друг)
 const TENT_TOP = 2.3;    // высота гребня палатки, м: стоящий человек помещается
 const TENT_DEPTH = 4.2;  // глубина палатки, м
 const TENT_WALL = 0.55;  // ширина коллайдера-стены вдоль ската: середина прохода открыта
-const HEAD_TURN = 2.2;   // насколько голова отворачивается от тела, рад
-const TURN_RATE = 8;     // скорость доворота корпуса спутника, рад/с
-const RIDE_SEAT = 0.87;  // седло пассажира: высота над землёй (сидит за спиной водителя)
-const RIDE_Z = -0.42;    // пассажир сидит позади оси мотоцикла (локальный −z)
-const HEAD_RIDE = 0.87;  // центр головы пассажира над его седлом
 
 // Лагерь на стороне карты напротив города: палатка, кострище и вешалки с бельём.
-// Тут респаун игрока; позже — место первых квестов.
-// Рядом живут дружелюбные: двое у костра и один у палатки сидят, один стоит у вешалок.
-// Когда игрок подходит ближе lookRange, их головы поворачиваются за ним.
-// Спутник в режиме follow подсаживается пассажиром, когда игрок заводит мотоцикл.
+// Тут респаун игрока; позже — место первых квестов. Рядом живут дружелюбные —
+// они вынесены в Friends, а лагерь отдаёт их наружу как свои поля.
 export class Camp {
   constructor(cfg, world) {
     this.cfg = cfg.camp;
@@ -30,26 +18,45 @@ export class Camp {
     this.world = world; // нужна карта высот: все объекты лагеря садятся на рельеф
     this.group = new THREE.Group();
     this.colliders = []; // палатка, столбы и полоса белья — сквозь них не пройти
-    this.friends = [];   // дружелюбные: позиция, поза и угол головы
     this.coverBoxes = []; // коробки для грида укрытий: сквозь палатку NPC не видит игрока
-
-    this._q = new THREE.Quaternion();
-    this._e = new THREE.Euler(0, 0, 0, 'XYZ'); // крен пассажира: поза с наклоном
-    this._p = new THREE.Vector3();
-    this._m = new THREE.Matrix4();
-    this._sZero = new THREE.Vector3(0, 0, 0); // нулевой масштаб: погасить пустые слоты седла
     this._t = 0; // время для огня: пламя и свет костра ходят по синусам
 
     this._buildTent();
     this._buildCampfire();
     this._buildRacks();
-    this._buildFriends();
+    this.people = new Friends(cfg, world, this.group, {
+      tent: this.tent,
+      fire: this.campfire,
+      city: { cx: this.city.cx, cz: this.city.cz },
+    });
 
     // тени от костра: их рисуют только объекты лагеря — дёшево и читаемо у огня
     if (this.cfg.fireShadows) this.group.traverse((o) => { if (o.isMesh) o.castShadow = true; });
     this.group.traverse((o) => { if (o.isMesh) o.receiveShadow = true; });
     for (const m of this.flame.children) m.castShadow = false; // само пламя тень не бросает
   }
+
+  // ---------- дружелюбные: наружу отдаём их как поля лагеря ----------
+  get friends() { return this.people.list; }
+  get parts() { return this.people.parts; }
+  get sitBody() { return this.people.sitBody; }
+  get sitShell() { return this.people.sitShell; }
+  get standBody() { return this.people.standBody; }
+  get standShell() { return this.people.standShell; }
+  get rideBody() { return this.people.rideBody; }
+  get rideShell() { return this.people.rideShell; }
+  get head() { return this.people.head; }
+  get headShell() { return this.people.headShell; }
+  get faces() { return this.people.faces; }
+
+  interact(f) { return this.people.interact(f); }
+  friendOf(object, instanceId) { return this.people.friendOf(object, instanceId); }
+  // урон другу от враждебных NPC (спутник квеста): здоровье и падение
+  damage(f, amount) { return this.people.damage(f, amount); }
+  // сброс (R): друзья снова живы и на местах — квест можно пройти заново
+  resetFriends() { this.people.resetAll(); }
+  // авария: пассажира выбило из седла — дальше он лежит и встаёт сам
+  ejectPassenger(b, fx, fz, speed, side) { return this.people.ejectPassenger(b, fx, fz, speed, side); }
 
   _groundAt(x, z) {
     const lift = this.world.cityLift ? this.world.cityLift(x, z) : 0; // горожанин — на покрытии
@@ -196,13 +203,13 @@ export class Camp {
 
     // свет костра: тёплый, мерцает; тени (по кнобу fireShadows) рисуют только
     // объекты лагеря — минимальная карта 256, пиксельный BasicShadowMap
-    this.fireLight = new THREE.PointLight(this.palette.fire, c.fireLight, 21, 2);
+    this.fireLight = new THREE.PointLight(this.palette.fire, c.fireLight, c.fireDist, c.fireDecay);
     this.fireLight.position.set(x, gy + 1.15, z);
     if (c.fireShadows) {
       this.fireLight.castShadow = true;
       this.fireLight.shadow.mapSize.set(256, 256);
       this.fireLight.shadow.camera.near = 0.3;
-      this.fireLight.shadow.camera.far = 21;
+      this.fireLight.shadow.camera.far = c.fireDist;
       this.fireLight.shadow.bias = -0.004;
     }
     this.group.add(this.fireLight);
@@ -252,128 +259,6 @@ export class Camp {
     });
   }
 
-  // Дружелюбные: тела — статичные instanced-меши, головы — свои матрицы (следят за игроком).
-  _buildFriends() {
-    const c = this.cfg;
-    const fx = c.x - 2; // ориентир взгляда в покое — костёр
-    const fz = c.z + 2;
-    const t = this.tent;
-    const list = [
-      { x: c.x + 3.2, z: c.z - 3.8, sit: true },           // у входа в палатку
-      { x: c.x - 3.3, z: c.z + 1.1, sit: true },           // у костра слева
-      { x: c.x - 0.6, z: c.z + 3.3, sit: true },           // у костра справа
-      { x: c.x + 3.8, z: c.z + 4.7, sit: false },          // у вешалок
-      { x: t.x, z: t.z - 1.35, sit: true, yaw: 0 },        // в палатке за столом, лицом к входу
-      { x: this.city.cx, z: this.city.cz, sit: false, yaw: Math.PI / 2 }, // в центре города: элемент задания
-    ];
-    for (const f of list) {
-      f.y = this._groundAt(f.x, f.z);
-      if (f.yaw === undefined) f.yaw = Math.atan2(fx - f.x, fz - f.z); // в покое смотрят на костёр
-      f.headYaw = 0; // доворот головы к игроку поверх поворота тела
-      f.headY = f.sit ? HEAD_SIT : HEAD_STAND;
-      f.mode = 'stay'; // 'stay' | 'follow': стоящих игрок зовёт за собой клавишей E
-      f.ride = false;  // сел пассажиром на мотоцикл (только follow рядом с седлом)
-      f.lean = 0;      // крен в поворотах — как у мотоцикла, пока едет пассажиром
-    }
-    this.friends = list;
-
-    const nSit = list.filter((f) => f.sit).length;
-    const nStand = list.length - nSit;
-    const bodyMat = new THREE.MeshLambertMaterial({ color: this.palette.friendBody, flatShading: true });
-    const headMat = new THREE.MeshLambertMaterial({ color: this.palette.npcHead, flatShading: true });
-    const shellMat = new THREE.MeshBasicMaterial({ color: this.palette.npcOutline, side: THREE.BackSide });
-
-    this.sitBody = new THREE.InstancedMesh(makeSitGeometry(), bodyMat, nSit);
-    this.sitShell = new THREE.InstancedMesh(makeSitGeometry(SHELL), shellMat, nSit);
-    this.standBody = new THREE.InstancedMesh(makeBodyGeometry(), bodyMat, nStand);
-    this.standShell = new THREE.InstancedMesh(makeBodyGeometry(SHELL), shellMat, nStand);
-    // пассажирская поза: спутник в седле мотоцикла — слотов по числу стоящих
-    this.rideBody = new THREE.InstancedMesh(makeRideGeometry(), bodyMat, nStand);
-    this.rideShell = new THREE.InstancedMesh(makeRideGeometry(SHELL), shellMat, nStand);
-    this.head = new THREE.InstancedMesh(makeFriendHead(), headMat, list.length);
-    this.headShell = new THREE.InstancedMesh(makeFriendHead(SHELL), shellMat, list.length);
-    // «лицо»: тёмная полоса глаз на передней грани головы — видно, куда друг смотрит
-    this.faces = new THREE.InstancedMesh(makeFriendFace(), new THREE.MeshBasicMaterial({ color: this.palette.npcOutline }), list.length);
-    this.head.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-    this.headShell.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-    this.faces.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-
-    this.parts = [this.sitBody, this.sitShell, this.standBody, this.standShell,
-      this.rideBody, this.rideShell, this.head, this.headShell, this.faces];
-    for (const m of this.parts) {
-      m.frustumCulled = false; // инстансы разбросаны — автосфера отсечения врёт
-      this.group.add(m);
-    }
-
-    this._syncBodies();
-    this._syncHeads();
-  }
-
-  // Тела друзей: спутник (follow) ходит за игроком, пассажир едет в седле —
-  // матрицы ставим каждый кадр. Пустые слоты седла гасим нулевым масштабом.
-  _syncBodies() {
-    let si = 0;
-    let ti = 0;
-    let ri = 0;
-    for (const f of this.friends) {
-      if (f.ride) {
-        // пассажир: сидит в седле, крен мотоцикла — наклоном тела (euler 0/yaw/lean)
-        this._e.set(0, f.yaw, f.lean);
-        this._q.setFromEuler(this._e);
-        this._p.set(f.x, f.y, f.z);
-        this._m.compose(this._p, this._q, ONE);
-        this.rideBody.setMatrixAt(ri, this._m);
-        this.rideShell.setMatrixAt(ri, this._m);
-        ri++;
-        continue;
-      }
-      const idx = f.sit ? si++ : ti++;
-      const body = f.sit ? this.sitBody : this.standBody;
-      const shell = f.sit ? this.sitShell : this.standShell;
-      this._q.setFromAxisAngle(UP, f.yaw);
-      this._p.set(f.x, f.y, f.z);
-      this._m.compose(this._p, this._q, ONE);
-      body.setMatrixAt(idx, this._m);
-      shell.setMatrixAt(idx, this._m);
-    }
-    for (let i = ri; i < this.rideBody.count; i++) {
-      this._m.compose(this._p.set(0, -50, 0), this._q.identity(), this._sZero);
-      this.rideBody.setMatrixAt(i, this._m);
-      this.rideShell.setMatrixAt(i, this._m);
-    }
-    this.sitBody.instanceMatrix.needsUpdate = true;
-    this.sitShell.instanceMatrix.needsUpdate = true;
-    this.standBody.instanceMatrix.needsUpdate = true;
-    this.standShell.instanceMatrix.needsUpdate = true;
-    this.rideBody.instanceMatrix.needsUpdate = true;
-    this.rideShell.instanceMatrix.needsUpdate = true;
-  }
-
-  // E на стоящем друге: зовём за собой; повторный E на спутнике — «жди здесь»:
-  // остаётся на месте, но корпус по-прежнему смотрит на игрока.
-  interact(f) {
-    if (!f || f.sit) return false;
-    f.mode = f.mode === 'follow' ? 'stay' : 'follow';
-    return true;
-  }
-
-  // Кого задел луч взгляда: голова — на любом друге, тело — только у стоящих.
-  friendOf(object, instanceId) {
-    if (instanceId === undefined) return null;
-    if (object === this.head || object === this.headShell || object === this.faces) return this.friends[instanceId] || null;
-    if (object === this.standBody || object === this.standShell) {
-      let k = 0;
-      for (const f of this.friends) {
-        if (f.sit) continue;
-        if (k === instanceId) return f;
-        k++;
-      }
-    }
-    return null;
-  }
-
-  // Игрок рядом — головы поворачиваются на него; ушёл — возвращаются к костру.
-  // bike: спутник в follow рядом с седлом подсаживается пассажиром и едет за спиной.
   update(dt, p, bike) {
     const c = this.cfg;
     this._t += dt;
@@ -391,138 +276,6 @@ export class Camp {
     fc[2].scale.y = 1 + 0.5 * Math.sin(t * 19.1 + 2.8);
     this.fireLight.intensity = c.fireLight * (0.95 + 0.22 * Math.sin(t * 15.3) * Math.sin(t * 7.7 + 1.3));
 
-    const k = 1 - Math.exp(-c.lookSpeed * dt);
-    for (const f of this.friends) {
-      if (f.ride) { // пассажир смотрит по курсу: голову к игроку не ворочает
-        f.headYaw += (0 - f.headYaw) * k;
-        continue;
-      }
-      const dx = p.x - f.x;
-      const dz = p.z - f.z;
-      let want = 0;
-      if (dx * dx + dz * dz < c.lookRange * c.lookRange) {
-        let d = Math.atan2(dx, dz) - f.yaw;
-        d = Math.atan2(Math.sin(d), Math.cos(d)); // кратчайший разворот
-        want = d < -HEAD_TURN ? -HEAD_TURN : d > HEAD_TURN ? HEAD_TURN : d;
-      }
-      f.headYaw += (want - f.headYaw) * k;
-    }
-
-    // спутник (позванный клавишей E): идёт за игроком; ближе followStop — стоит
-    // и смотрит на него; повторный E — «жди здесь» и он остаётся на месте
-    for (const f of this.friends) {
-      if (f.sit || f.ride || f.mode !== 'follow') continue;
-      const dx = p.x - f.x;
-      const dz = p.z - f.z;
-      const d = Math.hypot(dx, dz);
-      let want;
-      if (d > c.followStop) {
-        const nx = dx / d;
-        const nz = dz / d;
-        f.x += nx * c.followSpeed * dt;
-        f.z += nz * c.followSpeed * dt;
-        const res = resolveCircleAabb(f.x, f.z, 0.35, f.y, 1.75, this.world.colliders || []);
-        if (res.hit) {
-          f.x = res.x;
-          f.z = res.z;
-        }
-        f.y = this._groundAt(f.x, f.z);
-        want = Math.atan2(nx, nz); // корпус идёт за направлением движения
-      } else {
-        want = Math.atan2(dx, dz); // дошёл — разворачивается к игроку
-      }
-      let delta = Math.atan2(Math.sin(want - f.yaw), Math.cos(want - f.yaw));
-      const maxTurn = TURN_RATE * dt;
-      f.yaw += Math.abs(delta) <= maxTurn ? delta : Math.sign(delta) * maxTurn;
-    }
-
-    // пассажир: спутник в follow рядом с седлом садится за спину игрока; при
-    // высадке слезает слева от мотоцикла. Пока едет — поза и крен с мотоцикла.
-    if (bike) {
-      for (const f of this.friends) {
-        if (f.ride) {
-          if (bike.mounted) {
-            f.x = bike.pos.x + Math.sin(bike.yaw) * RIDE_Z;
-            f.z = bike.pos.z + Math.cos(bike.yaw) * RIDE_Z;
-            f.y = bike.pos.y + RIDE_SEAT;
-            f.yaw = bike.yaw;               // пассажир смотрит по курсу
-            f.lean = bike.group.rotation.z; // крен в поворотах — вместе с мотоциклом
-          } else {
-            f.x = bike.pos.x + Math.cos(bike.yaw) * 1.0; // слезает слева: l = (cos, −sin)
-            f.z = bike.pos.z - Math.sin(bike.yaw) * 1.0;
-            f.y = this._groundAt(f.x, f.z);
-            f.ride = false;
-            f.lean = 0;
-          }
-        } else if (bike.mounted && !f.sit && f.mode === 'follow') {
-          const dx = bike.pos.x - f.x;
-          const dz = bike.pos.z - f.z;
-          if (dx * dx + dz * dz <= c.boardRange * c.boardRange) f.ride = true;
-        }
-      }
-    }
-    this._syncBodies();
-    this._syncHeads();
+    this.people.update(dt, p, bike);
   }
-
-  _syncHeads() {
-    const n = this.friends.length;
-    for (let i = 0; i < n; i++) {
-      const f = this.friends[i];
-      if (f.ride) {
-        // пассажир: голова по курсу с креном, центр — над его седлом
-        this._e.set(0, f.yaw + f.headYaw, f.lean);
-        this._q.setFromEuler(this._e);
-        this._p.set(f.x, f.y + HEAD_RIDE, f.z);
-      } else {
-        this._q.setFromAxisAngle(UP, f.yaw + f.headYaw);
-        this._p.set(f.x, f.y + f.headY, f.z);
-      }
-      this._m.compose(this._p, this._q, ONE);
-      this.head.setMatrixAt(i, this._m);
-      this.headShell.setMatrixAt(i, this._m);
-      this.faces.setMatrixAt(i, this._m); // лицо смотрит туда же, куда голова
-    }
-    this.head.instanceMatrix.needsUpdate = true;
-    this.headShell.instanceMatrix.needsUpdate = true;
-    this.faces.instanceMatrix.needsUpdate = true;
-  }
-}
-
-// Тело пассажира: сидит на седле, ноги по бокам вниз-вперёд;
-// происхождение — на самом седле. inflate — раздутие для контура силуэта.
-function makeRideGeometry(inflate = 0) {
-  const hips = new THREE.BoxGeometry(0.46 + inflate, 0.24 + inflate, 0.4 + inflate);
-  hips.translate(0, 0.12, 0);
-  const torso = new THREE.BoxGeometry(0.5 + inflate, 0.52 + inflate, 0.3 + inflate);
-  torso.translate(0, 0.44, 0.02);
-  const legL = new THREE.BoxGeometry(0.15 + inflate, 0.44 + inflate, 0.17 + inflate);
-  legL.rotateX(-0.5);
-  legL.translate(-0.15, -0.12, 0.14);
-  const legR = legL.clone();
-  legR.translate(0.3, 0, 0);
-  return mergeGeometries([hips, torso, legL, legR]);
-}
-
-// Сидящее тело: таз, торс и вытянутые вперёд ноги; происхождение — на земле.
-function makeSitGeometry(inflate = 0) {
-  const hips = new THREE.BoxGeometry(0.46 + inflate, 0.3 + inflate, 0.42 + inflate);
-  hips.translate(0, 0.3, 0.02);
-  const torso = new THREE.BoxGeometry(0.52 + inflate, 0.6 + inflate, 0.32 + inflate);
-  torso.translate(0, 0.72, 0);
-  const legs = new THREE.BoxGeometry(0.4 + inflate, 0.24 + inflate, 0.62 + inflate);
-  legs.translate(0, 0.14, 0.35);
-  return mergeGeometries([hips, torso, legs]);
-}
-
-// Голова дружелюбного: геометрия вокруг шеи — матрица задаёт и позицию, и поворот.
-function makeFriendHead(inflate = 0) {
-  return new THREE.BoxGeometry(0.3 + inflate, 0.3 + inflate, 0.3 + inflate);
-}
-
-// «Лицо» друга: тёмная полоса глаз на передней грани головы (грань +z на 0.15).
-function makeFriendFace() {
-  const face = new THREE.BoxGeometry(0.2, 0.05, 0.04);
-  face.translate(0, 0.02, 0.16);
-  return face;
 }

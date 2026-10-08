@@ -58,6 +58,50 @@
     }
     #prompt.on { display: block; }
 
+    /* Строка цели квеста: живёт вне #hud (тот гаснет по F3) — видна всегда.
+       Слева стрелка-компас из 8 направлений, справа дистанция до цели. */
+    #objective {
+      position: fixed; top: 10px; left: 50%;
+      transform: translateX(-50%);
+      display: none; align-items: center; gap: 10px;
+      font: 13px/1.4 Consolas, "Courier New", monospace;
+      color: #f0efe4; text-shadow: 1px 1px 0 #000;
+      background: rgba(12, 14, 16, 0.5);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      padding: 4px 12px;
+      pointer-events: none; user-select: none;
+    }
+    #objective.on { display: flex; }
+    #objective-arrow { font-size: 16px; color: #f2c53d; }
+    #objective-dist { color: #9aa4ae; }
+
+    /* Субтитр: реплика друга в палатке, всплывает один раз и гаснет сам. */
+    #subtitle {
+      position: fixed; left: 50%; bottom: 22%;
+      transform: translateX(-50%);
+      display: none; max-width: 70vw; text-align: center;
+      font: 15px/1.5 Consolas, "Courier New", monospace;
+      color: #f5f2e6; text-shadow: 1px 1px 0 #000;
+      pointer-events: none; user-select: none;
+    }
+    #subtitle.on { display: block; }
+
+    /* Плашка диалога: говорящий + реплика + подсказка «E — дальше». */
+    #dialogue {
+      position: fixed; left: 50%; bottom: 8%;
+      transform: translateX(-50%);
+      display: none; width: min(680px, 82vw);
+      font: 14px/1.6 Consolas, "Courier New", monospace;
+      color: #f0efe4; text-shadow: 1px 1px 0 #000;
+      background: rgba(12, 14, 16, 0.72);
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      padding: 12px 16px;
+      pointer-events: none; user-select: none;
+    }
+    #dialogue.on { display: block; }
+    #dialogue-speaker { color: #f2c53d; letter-spacing: 1px; margin-bottom: 4px; }
+    #dialogue-hint { margin-top: 8px; color: #9aa4ae; font-size: 12px; text-align: right; }
+
     /* Красный фильтр полученного урона: плотность задаёт main.js по остатку здоровья */
     #damage {
       position: fixed; inset: 0;
@@ -87,6 +131,13 @@
   <div id="crosshair"></div>
   <div id="hitmarker"></div>
   <div id="prompt"></div>
+  <div id="objective"><span id="objective-arrow"></span><span id="objective-text"></span><span id="objective-dist"></span></div>
+  <div id="subtitle"></div>
+  <div id="dialogue">
+    <div id="dialogue-speaker"></div>
+    <div id="dialogue-text"></div>
+    <div id="dialogue-hint">E — дальше</div>
+  </div>
   <pre id="hud"></pre>
   <div id="hint">
     <div class="title">HARD-GRAPH</div>

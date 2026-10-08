@@ -24,6 +24,9 @@ export class Player {
     this.maxHp = cfg.player.maxHp;
     this.hp = this.maxHp;
     this.regenDelay = 0;
+    this.downT = 0;  // сколько ещё лежит (вылет из седла при аварии)
+    this.getUpT = 0; // сколько ещё встаёт
+    this.lie = 0;    // 0 — на ногах, 1 — лежит: поза и высота глаз
 
     this._fwd = new THREE.Vector3();
     this._right = new THREE.Vector3();
@@ -45,6 +48,9 @@ export class Player {
     this.eye = this.cfg.eyeHeight;
     this.hp = this.maxHp; // новый мир или смерть — здоровье полное
     this.regenDelay = 0;
+    this.downT = 0;
+    this.getUpT = 0;
+    this.lie = 0;
     this.syncCamera();
   }
 
@@ -61,12 +67,26 @@ export class Player {
     this.respawn();
   }
 
+  // Авария: игрока выбило из седла. Импульс задаёт main.js (по курсу мотоцикла
+  // и вбок), дальше тело летит само: down.time лежит, getUp встаёт.
+  throwOut(vx, vy, vz) {
+    this.downT = this.cfg.down.time;
+    this.getUpT = 0;
+    this.lie = 0;
+    this.vel.set(vx, vy, vz);
+    this.onGround = false;
+    this.crouching = false;
+  }
+
   syncCamera() {
     this.camera.position.set(this.pos.x, this.pos.y + this.eye, this.pos.z);
   }
 
   update(dt, input) {
     const c = this.cfg;
+
+    // лежит или встаёт: ввод не слушается, работает только физика тела
+    if (this.downT > 0 || this.getUpT > 0) return this._downed(dt);
 
     // направление взгляда, спроецированное на горизонталь
     this.camera.getWorldDirection(this._fwd);
@@ -171,6 +191,72 @@ export class Player {
       : sprinting ? 'бег'
       : moving ? 'шаг' : 'стоя';
 
+    this.syncCamera();
+  }
+
+  // Сбитое тело: гравитация, инерция, трение о землю, стены и границы мира.
+  // Капсула ниже стоячей — лёжа игрок не упирается макушкой в потолок.
+  _downed(dt) {
+    const c = this.cfg;
+    const d = c.down;
+
+    if (this.downT > 0) {
+      this.downT = Math.max(0, this.downT - dt);
+      if (this.downT === 0) this.getUpT = d.getUp; // полежал — встаём
+    } else {
+      this.getUpT = Math.max(0, this.getUpT - dt);
+    }
+
+    this.vel.y -= c.gravity * dt;
+    this.pos.x += this.vel.x * dt;
+    this.pos.z += this.vel.z * dt;
+    const res = resolveCircleAabb(this.pos.x, this.pos.z, c.radius, this.pos.y, c.crouchHeight, this.world.colliders);
+    if (res.hit) {
+      this.pos.x = res.x;
+      this.pos.z = res.z;
+      this.vel.x *= 0.3;
+      this.vel.z *= 0.3;
+    }
+    const limX = this.world.sizeX / 2 - 3;
+    const limZ = this.world.sizeZ / 2 - 3;
+    this.pos.x = Math.max(-limX, Math.min(limX, this.pos.x));
+    this.pos.z = Math.max(-limZ, Math.min(limZ, this.pos.z));
+
+    this.pos.y += this.vel.y * dt;
+    const terrainHere = this.world.heightmap.heightAt(this.pos.x, this.pos.z);
+    const ground = groundHeightAt(
+      this.pos.x, this.pos.z, terrainHere,
+      this.world.colliders, this.pos.y, c.stepHeight, c.radius * 0.9,
+    );
+    if (this.pos.y <= ground) {
+      this.pos.y = ground;
+      this.vel.y = 0;
+      this.onGround = true;
+      const f = Math.exp(-d.friction * dt); // трение о землю: отскок быстро гаснет
+      this.vel.x *= f;
+      this.vel.z *= f;
+    } else {
+      this.onGround = false;
+    }
+
+    // поза: плавно заваливаемся лёжа и так же плавно поднимаемся
+    const wantLie = this.downT > 0 ? 1 : this.getUpT / d.getUp;
+    this.lie += (wantLie - this.lie) * Math.min(1, dt * 8);
+    this.crouching = false;
+
+    if (this.regenDelay > 0) this.regenDelay = Math.max(0, this.regenDelay - dt);
+    else if (this.hp < this.maxHp) this.hp = Math.min(this.maxHp, this.hp + c.regen * dt);
+
+    this.hSpeed = Math.hypot(this.vel.x, this.vel.z);
+    this.state = this.downT > 0 ? 'лежит' : 'встаёт';
+
+    if (this.downT === 0 && this.getUpT === 0) {
+      this.lie = 0; // подъём закончен — снова на ногах, камера ровно
+      this.eye = c.eyeHeight;
+      this.state = 'стоя';
+    } else {
+      this.eye = d.eye + (c.eyeHeight - d.eye) * (1 - this.lie);
+    }
     this.syncCamera();
   }
 }

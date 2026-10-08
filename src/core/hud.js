@@ -22,7 +22,8 @@ export class Hud {
       `позиция ${s.pos.x.toFixed(1)} ${s.pos.y.toFixed(1)} ${s.pos.z.toFixed(1)}\n` +
       `скорость ${s.speed.toFixed(1)} м/с   ${s.state}   hp ${s.hp.toFixed(0)}\n` +
       `руки: ${s.item} [${s.slot}]   разрешение ${s.res}   сид ${s.seed}\n` +
-      `нпс ${s.npcs} (в бою ${s.alert})   баки ${s.bins}   мешки ${s.bags}   качается ${s.swaying}   искры ${s.sparks}`;
+      `нпс ${s.npcs} (в бою ${s.alert})   баки ${s.bins}   мешки ${s.bags}   качается ${s.swaying}   искры ${s.sparks}\n` +
+      `квест: ${s.quest}`;
   }
 
   setHintVisible(v) {

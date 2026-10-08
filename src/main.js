@@ -1,44 +1,23 @@
 import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 import { CONFIG } from './config.js';
-import { buildLayout, rockColliders, binColliders, makeCityLift } from './world/placement.js';
-import { createTerrain } from './world/terrain.js';
-import { createPavement } from './world/pavement.js';
-import { Trees } from './world/trees.js';
-import { createBuildings } from './world/buildings.js';
-import { Rocks } from './world/rocks.js';
-import { Bushes } from './world/bushes.js';
-import { Signs } from './world/signs.js';
-import { Bins } from './world/bins.js';
-import { TrashBags, pushBagsByBins } from './world/bags.js';
-import { Npcs, buildCovers } from './world/npc.js';
-import { Camp } from './world/camp.js';
-import { Motorcycle } from './world/bike.js';
+import { Render } from './render.js';
+import { buildWorld, disposeWorld } from './world/assemble.js';
+import { pushBagsByBins } from './world/props.js';
 import { Player, hurtKick } from './player/player.js';
 import { Viewmodel } from './player/viewmodel.js';
 import { Impacts } from './world/impacts.js';
 import { Input } from './core/input.js';
 import { resolveCircleAabb } from './core/collide.js';
 import { Hud } from './core/hud.js';
+import { Quest } from './quest/quest.js';
+import { QuestUI } from './quest/quest-ui.js';
+import { Markers } from './quest/markers.js';
 
-// ---------- рендерер: честный low-res ----------
+// ---------- рендерер, сцена, камера ----------
 const canvas = document.getElementById('game');
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
-renderer.setPixelRatio(1); // пиксели — это пиксели
-renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.BasicShadowMap; // тени рисует только костёр лагеря — минимальная карта
-
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(CONFIG.palette.sky);
-scene.fog = new THREE.Fog(CONFIG.palette.fog, CONFIG.render.fogNear, CONFIG.render.fogFar);
-
-const camera = new THREE.PerspectiveCamera(CONFIG.camera.fov, 1, CONFIG.camera.near, CONFIG.camera.far);
-camera.rotation.order = 'YXZ'; // обязательный порядок осей для FPS-обзора
-
-scene.add(new THREE.HemisphereLight(0xdfe8f2, 0x4a4a3f, 1.0));
-const sun = new THREE.DirectionalLight(0xfff2d9, 1.1);
-sun.position.set(60, 100, 35);
-scene.add(sun);
+const render = new Render(canvas, CONFIG);
+const { renderer, scene, camera } = render;
 
 // ---------- управление ----------
 const controls = new PointerLockControls(camera, canvas);
@@ -59,106 +38,18 @@ controls.addEventListener('unlock', () => hint.classList.remove('hidden'));
 const input = new Input(controls);
 const hud = new Hud();
 
-// ---------- низкое разрешение ----------
-let resIndex = CONFIG.render.defaultRes;
-let aspect = 1;
-
-function applyResolution() {
-  aspect = window.innerWidth / window.innerHeight;
-  const h = CONFIG.render.resHeights[resIndex];
-  const w = Math.max(2, Math.round(h * aspect));
-  renderer.setSize(w, h, false); // рисуем в маленький буфер, CSS растягивает
-  camera.aspect = aspect;
-  camera.updateProjectionMatrix();
-}
-
-window.addEventListener('resize', applyResolution);
-applyResolution();
-
 // ---------- мир ----------
 let world = null;
 let seed = CONFIG.seed;
-
-function disposeWorld() {
-  if (!world) return;
-  const parts = [
-    world.terrain, world.pavement.group, world.buildings.group,
-    ...world.npcs.parts, ...world.npcs.debug, world.trees.trunks, world.trees.crowns,
-    world.rocks.mesh, world.bushes.mesh, world.signs.group, world.bins.mesh, world.bags.mesh,
-    world.camp.group, world.bike.group,
-  ];
-  for (const part of parts) {
-    scene.remove(part);
-    part.traverse((n) => {
-      if (n.geometry) n.geometry.dispose();
-      if (n.material) {
-        const mats = Array.isArray(n.material) ? n.material : [n.material];
-        for (const m of mats) {
-          if (m.map) m.map.dispose();
-          m.dispose();
-        }
-      }
-    });
-  }
-  world = null;
-}
+let quest = null; // создаётся после первого мира; перепривязывается на G
 
 function rebuildWorld(newSeed) {
-  disposeWorld();
+  disposeWorld(world, scene);
   seed = newSeed;
   interactFriend = null; // старый мир исчез — и цель взаимодействия тоже
-  const cfg = { ...CONFIG, seed };
-
-  const layout = buildLayout(cfg);
-  const terrain = createTerrain(layout.heightmap, cfg);
-  scene.add(terrain);
-
-  const pavement = createPavement(layout.heightmap, layout.buildings, cfg);
-  scene.add(pavement.group);
-
-  const buildings = createBuildings(layout.buildings, cfg);
-  scene.add(buildings.group);
-
-  const trees = new Trees(layout.trees, cfg);
-  trees.addTo(scene);
-
-  const rocks = new Rocks(layout.rocks, cfg);
-  scene.add(rocks.mesh);
-
-  const bushes = new Bushes(layout.bushes, cfg);
-  scene.add(bushes.mesh);
-
-  const binCols = binColliders(layout.bins, cfg); // коллайдеры баков: физика двигает их вместе с баками
-  world = {
-    heightmap: layout.heightmap,
-    // дома + валуны + баки: сквозь них не пройти
-    colliders: buildings.colliders.concat(rockColliders(layout.rocks), binCols),
-    sizeX: CONFIG.world.sizeX,
-    sizeZ: CONFIG.world.sizeZ,
-    cityLift: makeCityLift(cfg, layout.buildings), // высота покрытия в городе (нужна физике мешков)
-    terrain,
-    pavement,
-    buildings,
-    trees,
-    rocks,
-    bushes,
-    npcs: null,
-  };
-  world.signs = new Signs(layout.signs, cfg);
-  scene.add(world.signs.group);
-  world.bins = new Bins(layout.bins, cfg, world, binCols);
-  scene.add(world.bins.mesh);
-  world.bags = new TrashBags(layout.bags, CONFIG, world);
-  scene.add(world.bags.mesh);
-  world.camp = new Camp(cfg, world); // лагерь напротив города: спавн, дружелюбные, постройки
-  scene.add(world.camp.group);
-  world.colliders.push(...world.camp.colliders);
-  // мотоцикл у лагеря: кинематический, корпус — коллайдер для пешеходов
-  world.bike = new Motorcycle(cfg, world);
-  scene.add(world.bike.group);
-  world.npcs = new Npcs(layout.npcs, CONFIG, world, buildCovers(cfg, layout, world.camp.coverBoxes));
-  world.npcs.addTo(scene);
+  world = buildWorld({ ...CONFIG, seed }, scene);
   world.npcs.setDebug(hud.visible); // отладочные зоны зрения живут вместе с HUD (F3)
+  if (quest) quest.attach(world); // новый мир — новые друзья, квест с начала
   return world;
 }
 
@@ -170,12 +61,29 @@ const viewmodel = new Viewmodel(CONFIG);
 const impacts = new Impacts(CONFIG);
 scene.add(impacts.group);
 
+// Квест «Вывести Малого»: логика, DOM-слой и маркер «!». Маркер живёт на сцене
+// постоянно (не в world.disposables) — переживает пересборку мира на G.
+quest = new Quest(CONFIG, world.camp.friends, {
+  cx: CONFIG.city.cx, cz: CONFIG.city.cz, halfW: CONFIG.city.halfW, halfD: CONFIG.city.halfD,
+});
+const questUI = new QuestUI();
+const markers = new Markers(CONFIG);
+markers.addTo(scene);
+
 // NPC сообщает о себе наружу: урон игроку, вспышка и след выстрела у ствола
 const npcMuzzlePos = new THREE.Vector3();
 const npcMuzzleDir = new THREE.Vector3();
 const npcTraceTo = new THREE.Vector3();
 const npcHooks = {
   playerDamage: (amount, from) => hurt(amount, from),
+  // урон спутнику квеста: здоровье и падение — в лагере, кровь — здесь (пул impacts)
+  friendDamage: (f, amount, from) => {
+    if (!world.camp.damage(f, amount)) return;
+    const dx = f.x - (from ? from.x : f.x);
+    const dz = f.z - (from ? from.z : f.z);
+    const len = Math.hypot(dx, dz) || 1;
+    impacts.spawnBlood(tmpHit.set(f.x, f.y + 1.0, f.z), tmpFlat.set(dx / len, 0, dz / len));
+  },
   muzzle: (pos, dir) => {
     impacts.spawn(npcMuzzlePos.set(pos.x, pos.y, pos.z), npcMuzzleDir.set(dir.x, dir.y, dir.z));
     impacts.flash(npcMuzzlePos); // ярко: сразу видно, откуда стреляют
@@ -199,6 +107,43 @@ let hurtRoll = 0;
 let hurtPitchA = 0;
 let hurtYawA = 0;
 let hurtRollA = 0;
+
+// Авария: тряска камеры и крен «лёжа». Крен ведём отдельным компенсированным
+// каналом по образцу hurtRoll — иначе камера навсегда уедет на бок.
+let shakeT = 0;
+let shakeAmp = 0;
+let lieRollA = 0;
+
+// Игрок сбит: лежит после аварии или встаёт. В этом состоянии ни сесть на
+// мотоцикл, ни позвать друга, ни выстрелить.
+const isDown = () => player.downT > 0 || player.getUpT > 0;
+
+// Таран на большой скорости: обоих выбивает из седла. Вызывается сразу после
+// bike.update и до camp.update — иначе пассажир «слезет» штатно, а не вылетит.
+function crashOut(ev) {
+  const b = world.bike;
+  const c = CONFIG.bike.crash;
+  const fx = Math.sin(b.yaw);
+  const fz = Math.cos(b.yaw);
+  const rx = -fz; // правый бок мотоцикла: r = (−cos, sin)
+  const rz = fx;
+  b.ejectRider();
+  // старт броска — чуть выше корпуса: иначе мотоцикл вытолкнет тело из своей же коробки
+  player.pos.set(b.pos.x, b.collider.maxY + 0.05, b.pos.z);
+  player.throwOut(
+    fx * ev.speed * c.ejectFwd + rx * c.ejectSide,
+    c.ejectUp,
+    fz * ev.speed * c.ejectFwd + rz * c.ejectSide,
+  );
+  player.syncCamera();
+  world.camp.ejectPassenger(b, fx, fz, ev.speed, -c.ejectSide); // пассажир летит в другую сторону
+  if (c.damage > 0) hurt(c.damage);
+  shakeT = c.shakeTime;
+  shakeAmp = c.shakeAmp;
+  hurtPitch += (Math.random() * 2 - 1) * c.shakeAmp;
+  hurtYaw += (Math.random() * 2 - 1) * c.shakeAmp;
+  hurtRoll += (Math.random() * 2 - 1) * c.shakeAmp * 2;
+}
 
 function hurt(amount, from) {
   // смертельный урон в седле: сначала слезаем, потом игрок падает на спавне
@@ -360,6 +305,14 @@ function dismountBike() {
 function updatePrompt() {
   interactFriend = null;
   interactBike = false;
+  if (quest.talking) { // открыт диалог — никаких подсказок взаимодействия
+    promptEl.classList.remove('on');
+    return;
+  }
+  if (isDown()) { // лежит — никакого взаимодействия
+    promptEl.classList.remove('on');
+    return;
+  }
   if (world.bike.mounted) {
     promptEl.textContent = '[E] — сойти с мотоцикла · L — свет';
     promptEl.classList.add('on');
@@ -374,7 +327,8 @@ function updatePrompt() {
     );
     if (hits.length && hits[0].distance <= CONFIG.camp.interactRange) {
       const f = world.camp.friendOf(hits[0].object, hits[0].instanceId);
-      if (f && !f.sit) interactFriend = f;
+      // стоячий — зовём за собой; друг в палатке (сидит) — говорим, пока квест не взят
+      if (f && (!f.sit || quest.canTalkTo(f))) interactFriend = f;
     }
     if (!interactFriend) {
       const bh = raycaster.intersectObject(world.bike.group, true);
@@ -382,7 +336,8 @@ function updatePrompt() {
     }
   }
   if (interactFriend) {
-    promptEl.textContent = interactFriend.mode === 'follow' ? '[E] — подожди здесь' : '[E] — взаимодействовать';
+    promptEl.textContent = quest.canTalkTo(interactFriend) ? '[E] — поговорить'
+      : interactFriend.mode === 'follow' ? '[E] — подожди здесь' : '[E] — взаимодействовать';
     promptEl.classList.add('on');
   } else if (interactBike) {
     promptEl.textContent = '[E] — сесть на мотоцикл';
@@ -411,11 +366,13 @@ viewmodel.select(CONFIG.hands.slots[0]); // в руках палка
 const STEP = 1 / 120;
 let acc = 0;
 const clock = new THREE.Clock();
-const sizeVec = new THREE.Vector2();
 
 function step(dt) {
-  const riding = world.bike.mounted;
-  if (riding) {
+  const talking = quest.talking; // диалог: движение и стрельба заморожены
+  const riding = world.bike.mounted && !talking;
+  if (talking) {
+    player.hSpeed = 0; // стоим на месте, камеру можно вращать мышью
+  } else if (riding) {
     // в седле игрок не ходит сам: его везёт мотоцикл, глаза — на высоте райдера
     player.pos.set(world.bike.pos.x, world.bike.pos.y, world.bike.pos.z);
     player.vel.set(0, 0, 0);
@@ -428,26 +385,32 @@ function step(dt) {
     player.update(dt, input);
   }
   world.bike.update(dt, riding ? input : null);
-  // присед игрока урезает дальность обнаружения — стелс
-  world.npcs.update(dt, player.pos, npcHooks, { crouch: player.crouching });
+  // удар на ходу: выбивает из седла до того, как лагерь успеет «высадить» пассажира
+  const ev = world.bike.crashEvent;
+  if (riding && ev && ev.eject) crashOut(ev);
+  // присед игрока урезает дальность обнаружения — стелс; спутники квеста тоже цели
+  world.npcs.update(dt, player.pos, npcHooks, { crouch: player.crouching, friends: world.camp.friends });
   world.camp.update(dt, player.pos, world.bike); // дружелюбные следят за игроком и подсаживаются пассажиром
   world.bins.update(dt);
   pushBagsByBins(world.bags, world.bins, CONFIG.street.bagPush); // проехал ли бак по мешку
   world.bags.update(dt);
+  quest.update(dt, player.pos); // субтитр у палатки и переходы escort → done | failed
 
   for (const code of input.consumePressed()) {
     if (code === 'KeyV') {
-      resIndex = (resIndex + 1) % CONFIG.render.resHeights.length;
-      applyResolution();
+      render.cycleResolution();
     } else if (code === 'F3') {
       hud.toggle();
       world.npcs.setDebug(hud.visible); // зоны зрения NPC — отладочный слой HUD
-    } else if (code === 'KeyE') {
-      // E: в седле — сойти; иначе — дружелюбный, иначе — сесть на мотоцикл
-      if (world.bike.mounted) dismountBike();
+    } else if (code === 'KeyE' && !isDown()) {
+      // E: в диалоге — дальше; в седле — сойти; друг в палатке — заговорить;
+      // иначе standing-друг (позвать/ждать) или мотоцикл
+      if (quest.talking) quest.advance();
+      else if (world.bike.mounted) dismountBike();
+      else if (interactFriend && quest.canTalkTo(interactFriend)) quest.openDialogue();
       else if (interactFriend && world.camp.interact(interactFriend)) updatePrompt();
       else if (interactBike) mountBike();
-    } else if (code === 'KeyL') {
+    } else if (code === 'KeyL' && !isDown()) {
       // L: фара мотоцикла по кругу — выкл → ближний → дальний (в седле или рядом)
       if (world.bike.mounted || interactBike) world.bike.toggleLight();
     } else if (code === 'KeyR') {
@@ -455,6 +418,8 @@ function step(dt) {
       world.bins.resetAll();
       world.bags.resetAll();
       world.bike.reset();
+      world.camp.resetFriends(); // друзья живы и на местах
+      quest.reset();             // квест можно пройти заново
     } else if (code === 'KeyG') {
       rebuildWorld(seed + 1);
       player.setWorld(world);
@@ -470,7 +435,7 @@ function step(dt) {
     }
   }
 
-  if (input.consumeAttack() && !world.bike.mounted) viewmodel.startPrimary(); // в седле руки на руле
+  if (input.consumeAttack() && !world.bike.mounted && !isDown() && !quest.talking) viewmodel.startPrimary(); // в седле и в диалоге руки заняты
 }
 
 function frame() {
@@ -486,7 +451,8 @@ function frame() {
   // вьюмодель ведёт себя сама и читает view.aim
   const aimCfg = viewmodel.currentId === 'pistol' ? CONFIG.pistol
     : viewmodel.currentId === 'stick' ? CONFIG.stick : null;
-  const aiming = !!(input.rmb && controls.isLocked && aimCfg && viewmodel.pendingId === null && !world.bike.mounted);
+  const aiming = !!(input.rmb && controls.isLocked && aimCfg && viewmodel.pendingId === null &&
+    !world.bike.mounted && !isDown());
   const fovTarget = aiming ? aimCfg.aimFov : CONFIG.camera.fov;
   if (camera.fov !== fovTarget) {
     const aimSpeed = aimCfg ? aimCfg.aimSpeed : CONFIG.pistol.aimSpeed;
@@ -505,6 +471,15 @@ function frame() {
   camera.rotation.x += pitchKick - appliedKick;
   appliedKick = pitchKick;
 
+  // тряска после аварии: случайные рывки, затухают вместе с каналами hurt
+  if (shakeT > 0) {
+    shakeT = Math.max(0, shakeT - dt);
+    const a = shakeAmp * (shakeT / CONFIG.bike.crash.shakeTime);
+    hurtPitch += (Math.random() * 2 - 1) * a;
+    hurtYaw += (Math.random() * 2 - 1) * a;
+    hurtRoll += (Math.random() * 2 - 1) * a;
+  }
+
   // качение от полученных ударов: затухает за hurt.time
   const hurtK = Math.exp(-CONFIG.player.hurt.decay * dt);
   hurtPitch *= hurtK;
@@ -519,6 +494,12 @@ function frame() {
   hurtPitchA = hurtPitch;
   hurtYawA = hurtYaw;
   hurtRollA = hurtRoll;
+
+  // крен лёжа: камера заваливается на бок вместе с телом и возвращается ровно,
+  // когда игрок встал. Канал компенсированный — суммарно камера никуда не уезжает.
+  const lieRoll = player.lie * CONFIG.player.down.roll;
+  camera.rotation.z += lieRoll - lieRollA;
+  lieRollA = lieRoll;
 
   // красный фильтр урона: гаснет за hurt.time, плотнее при низком hp
   if (dmgT > 0) {
@@ -540,12 +521,31 @@ function frame() {
 
   updatePrompt(); // подсказка «E»: прицел на дружелюбном в пределах дистанции
 
-  renderer.getSize(sizeVec);
+  // квест: маркер «!» над целью, плашка диалога, субтитр и строка цели с компасом
+  const mp = quest.markerPos;
+  markers.update(mp, dt);
+  if (quest.talking) {
+    questUI.showDialogue(quest.currentLine(), quest.line >= quest.lines.length - 1);
+  } else {
+    questUI.hideDialogue();
+  }
+  questUI.setSubtitle(quest.subtitle);
+  const objText = quest.objective;
+  if (objText && mp) {
+    camera.getWorldDirection(tmpDir);
+    const toX = mp.x - camera.position.x;
+    const toZ = mp.z - camera.position.z;
+    questUI.setObjective(objText, QuestUI.arrowFor(tmpDir.x, tmpDir.z, toX, toZ), Math.hypot(toX, toZ));
+  } else {
+    questUI.setObjective(objText, '', null);
+  }
+
+  const size = render.size;
   hud.update(dt, {
     pos: player.pos,
     speed: player.hSpeed,
     state: player.state,
-    res: `${sizeVec.x}x${sizeVec.y}`,
+    res: `${size.x}x${size.y}`,
     seed,
     item: viewmodel.current ? viewmodel.current.label : '—',
     slot: viewmodel.currentId ? CONFIG.hands.slots.indexOf(viewmodel.currentId) + 1 : 0,
@@ -556,9 +556,10 @@ function frame() {
     bags: world.bags.awakeCount,
     swaying,
     sparks: impacts.activeCount,
+    quest: quest.stage,
   });
 
-  viewmodel.render(renderer, scene, camera, aspect, !world.bike.mounted); // в седле вьюмодель скрыта
+  viewmodel.render(renderer, scene, camera, render.aspect, !world.bike.mounted && !isDown()); // в седле и лёжа руки не видны
 }
 
 frame();
