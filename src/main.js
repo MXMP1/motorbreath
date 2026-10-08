@@ -11,8 +11,8 @@ import { Bushes } from './world/bushes.js';
 import { Signs } from './world/signs.js';
 import { Bins } from './world/bins.js';
 import { TrashBags, pushBagsByBins } from './world/bags.js';
-import { Dummies } from './world/dummies.js';
-import { Player } from './player/player.js';
+import { Npcs, buildCovers } from './world/npc.js';
+import { Player, hurtKick } from './player/player.js';
 import { Viewmodel } from './player/viewmodel.js';
 import { Impacts } from './world/impacts.js';
 import { Input } from './core/input.js';
@@ -40,6 +40,7 @@ const controls = new PointerLockControls(camera, canvas);
 controls.pointerSpeed = CONFIG.player.sens / 0.002;
 
 const hint = document.getElementById('hint');
+const damageEl = document.getElementById('damage'); // красный фильтр урона
 document.addEventListener('click', () => { if (!controls.isLocked) controls.lock(); });
 controls.addEventListener('lock', () => hint.classList.add('hidden'));
 controls.addEventListener('unlock', () => hint.classList.remove('hidden'));
@@ -71,7 +72,7 @@ function disposeWorld() {
   if (!world) return;
   const parts = [
     world.terrain, world.pavement.group, world.buildings.group,
-    world.dummies.group, world.trees.trunks, world.trees.crowns,
+    ...world.npcs.parts, world.trees.trunks, world.trees.crowns,
     world.rocks.mesh, world.bushes.mesh, world.signs.group, world.bins.mesh, world.bags.mesh,
   ];
   for (const part of parts) {
@@ -127,7 +128,7 @@ function rebuildWorld(newSeed) {
     trees,
     rocks,
     bushes,
-    dummies: null,
+    npcs: null,
   };
   world.signs = new Signs(layout.signs, cfg);
   scene.add(world.signs.group);
@@ -135,8 +136,8 @@ function rebuildWorld(newSeed) {
   scene.add(world.bins.mesh);
   world.bags = new TrashBags(layout.bags, CONFIG, world);
   scene.add(world.bags.mesh);
-  world.dummies = new Dummies(layout.dummies, CONFIG, world);
-  scene.add(world.dummies.group);
+  world.npcs = new Npcs(layout.npcs, CONFIG, world, buildCovers(cfg, layout));
+  world.npcs.addTo(scene);
   return world;
 }
 
@@ -148,24 +149,63 @@ const viewmodel = new Viewmodel(CONFIG);
 const impacts = new Impacts(CONFIG);
 scene.add(impacts.group);
 
+// NPC сообщает о себе наружу: урон игроку, вспышка и след выстрела у ствола
+const npcMuzzlePos = new THREE.Vector3();
+const npcMuzzleDir = new THREE.Vector3();
+const npcTraceTo = new THREE.Vector3();
+const npcHooks = {
+  playerDamage: (amount, from) => hurt(amount, from),
+  muzzle: (pos, dir) => {
+    impacts.spawn(npcMuzzlePos.set(pos.x, pos.y, pos.z), npcMuzzleDir.set(dir.x, dir.y, dir.z));
+    impacts.flash(npcMuzzlePos); // ярко: сразу видно, откуда стреляют
+  },
+  // след пули: до игрока при попадании или мимо него при промахе
+  tracer: (from, to) => impacts.tracer(npcMuzzlePos.set(from.x, from.y, from.z), npcTraceTo.set(to.x, to.y, to.z)),
+};
+
 // Кик камеры при выстреле/ударе: добавляем смещение питча, потом компенсируем его же
 // при затухании, чтобы суммарно камера не «уехала».
 let pitchKick = 0;
 let appliedKick = 0;
 
+// Попадание по игроку: красный фильтр (ярче, чем ниже здоровье) и качение камеры —
+// рывок уводит взгляд в сторону, противоположную удару.
+let dmgT = 0;
+let dmgAlpha = 0;
+let hurtPitch = 0;
+let hurtYaw = 0;
+let hurtRoll = 0;
+let hurtPitchA = 0;
+let hurtYawA = 0;
+let hurtRollA = 0;
+
+function hurt(amount, from) {
+  player.damage(amount);
+  const h = CONFIG.player.hurt;
+  dmgT = h.time;
+  dmgAlpha = h.redMin + (h.redMax - h.redMin) * (1 - player.hp / player.maxHp);
+  if (!from) return;
+  camera.getWorldDirection(tmpDir);
+  const k = hurtKick(from.x, from.z, player.pos.x, player.pos.z, tmpDir.x, tmpDir.z, h);
+  hurtPitch += k.pitch;
+  hurtYaw += k.yaw;
+  hurtRoll += k.roll;
+}
+
 const tmpDir = new THREE.Vector3();
 const tmpFlat = new THREE.Vector3();
 const raycaster = new THREE.Raycaster();
 raycaster.far = CONFIG.pistol.range;
+const PISTOL_HIT = { damage: CONFIG.pistol.damage, knockback: CONFIG.pistol.knockback }; // импульс NPC от пули
 
-// Удар палкой: сфера по лучу взгляда — деревья качаются, манекены отлетают.
+// Удар палкой: сфера по лучу взгляда — деревья качаются, NPC получает урон и злится.
 function stickHit() {
   camera.getWorldDirection(tmpDir);
   const cx = camera.position.x + tmpDir.x * CONFIG.stick.reach;
   const cy = camera.position.y + tmpDir.y * CONFIG.stick.reach;
   const cz = camera.position.z + tmpDir.z * CONFIG.stick.reach;
 
-  // горизонтальное направление удара — общее для манекенов и мешков
+  // горизонтальное направление удара — общее для NPC, мешков и баков
   tmpFlat.set(tmpDir.x, 0, tmpDir.z);
   if (tmpFlat.lengthSq() < 1e-6) tmpFlat.set(0, 0, -1);
   tmpFlat.normalize();
@@ -175,13 +215,14 @@ function stickHit() {
   const bushIndex = world.bushes.findNearest(cx, cy, cz, CONFIG.stick.hitRadius);
   if (bushIndex >= 0) world.bushes.hit(bushIndex);
 
-  for (let i = 0; i < world.dummies.units.length; i++) {
-    const u = world.dummies.units[i];
+  // NPC: палка бьёт больно — прилетело, значит, знает откуда
+  for (let i = 0; i < world.npcs.units.length; i++) {
+    const u = world.npcs.units[i];
     const dx = u.pos.x - cx;
     const dy = u.pos.y + 0.9 - cy;
     const dz = u.pos.z - cz;
     if (dx * dx + dy * dy + dz * dz < 1.35 * 1.35) {
-      world.dummies.hit(i, tmpFlat, CONFIG.stick);
+      world.npcs.hit(i, tmpFlat, CONFIG.stick, camera.position);
     }
   }
 
@@ -211,35 +252,26 @@ function stickHit() {
 }
 
 // Выстрел из пистолета: хитсякан по мешам мира, искры в точке попадания,
-// импульс манекену, покачивание дереву.
+// урон NPC, покачивание дереву.
 function shoot() {
   camera.getWorldDirection(tmpDir);
   raycaster.set(camera.position, tmpDir);
   const hits = raycaster.intersectObjects(
     [world.terrain, world.pavement.group, world.buildings.group,
      world.trees.trunks, world.trees.crowns, world.rocks.mesh, world.bushes.mesh,
-     world.bins.mesh, world.signs.group, world.bags.mesh, world.dummies.group],
+     world.bins.mesh, world.signs.group, world.bags.mesh, ...world.npcs.parts],
     true,
   );
   if (hits.length === 0) return;
   const hit = hits[0];
 
-  // попали в манекен? поднимаемся по родителям до группы с индексом
-  let dummyIdx = -1;
-  let node = hit.object;
-  while (node) {
-    if (typeof node.userData.dummyIndex === 'number') { dummyIdx = node.userData.dummyIndex; break; }
-    if (node === world.dummies.group) break;
-    node = node.parent;
-  }
-
-  // горизонтальное направление выстрела — общее для манекенов и мешков
+  // горизонтальное направление выстрела — общее для NPC, мешков и баков
   tmpFlat.set(tmpDir.x, 0, tmpDir.z);
   if (tmpFlat.lengthSq() < 1e-6) tmpFlat.set(0, 0, -1);
   tmpFlat.normalize();
 
-  if (dummyIdx >= 0) {
-    world.dummies.hit(dummyIdx, tmpFlat, CONFIG.pistol.impact);
+  if (hit.object.userData.npc && hit.instanceId !== undefined) {
+    world.npcs.hit(hit.instanceId, tmpFlat, PISTOL_HIT, camera.position);
   } else if ((hit.object === world.trees.trunks || hit.object === world.trees.crowns) && hit.instanceId !== undefined) {
     world.trees.hit(hit.instanceId);
   } else if (hit.object === world.bushes.mesh && hit.instanceId !== undefined) {
@@ -277,7 +309,7 @@ const sizeVec = new THREE.Vector2();
 
 function step(dt) {
   player.update(dt, input);
-  world.dummies.update(dt);
+  world.npcs.update(dt, player.pos, npcHooks);
   world.bins.update(dt);
   pushBagsByBins(world.bags, world.bins, CONFIG.street.bagPush); // проехал ли бак по мешку
   world.bags.update(dt);
@@ -289,7 +321,7 @@ function step(dt) {
     } else if (code === 'F3') {
       hud.toggle();
     } else if (code === 'KeyR') {
-      world.dummies.resetAll();
+      world.npcs.resetAll();
       world.bins.resetAll();
       world.bags.resetAll();
     } else if (code === 'KeyG') {
@@ -329,6 +361,29 @@ function frame() {
   camera.rotation.x += pitchKick - appliedKick;
   appliedKick = pitchKick;
 
+  // качение от полученных ударов: затухает за hurt.time
+  const hurtK = Math.exp(-CONFIG.player.hurt.decay * dt);
+  hurtPitch *= hurtK;
+  hurtYaw *= hurtK;
+  hurtRoll *= hurtK;
+  if (Math.abs(hurtPitch) < 1e-5) hurtPitch = 0;
+  if (Math.abs(hurtYaw) < 1e-5) hurtYaw = 0;
+  if (Math.abs(hurtRoll) < 1e-5) hurtRoll = 0;
+  camera.rotation.x += hurtPitch - hurtPitchA;
+  camera.rotation.y += hurtYaw - hurtYawA;
+  camera.rotation.z += hurtRoll - hurtRollA;
+  hurtPitchA = hurtPitch;
+  hurtYawA = hurtYaw;
+  hurtRollA = hurtRoll;
+
+  // красный фильтр урона: гаснет за hurt.time, плотнее при низком hp
+  if (dmgT > 0) {
+    dmgT = Math.max(0, dmgT - dt);
+    damageEl.style.opacity = (dmgAlpha * (dmgT / CONFIG.player.hurt.time)).toFixed(3);
+  } else if (damageEl.style.opacity !== '0') {
+    damageEl.style.opacity = '0';
+  }
+
   renderer.getSize(sizeVec);
   hud.update(dt, {
     pos: player.pos,
@@ -338,7 +393,9 @@ function frame() {
     seed,
     item: viewmodel.current ? viewmodel.current.label : '—',
     slot: viewmodel.currentId ? CONFIG.hands.slots.indexOf(viewmodel.currentId) + 1 : 0,
-    awake: world.dummies.awakeCount,
+    npcs: world.npcs.aliveCount,
+    alert: world.npcs.alertCount,
+    hp: player.hp,
     bins: world.bins.awakeCount,
     bags: world.bags.awakeCount,
     swaying,

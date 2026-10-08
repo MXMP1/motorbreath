@@ -18,6 +18,35 @@ export class Impacts {
       this.group.add(mesh);
       this.units.push({ mesh, vel: new THREE.Vector3(), life: 0 });
     }
+
+    // Яркие вспышки выстрелов NPC: светящийся кристалл, самого яркого цвета в палитре.
+    // Материал без освещения — в тумане боя видно, откуда стреляют.
+    this.flashes = [];
+    this.flashNext = 0;
+    const flashGeo = new THREE.OctahedronGeometry(this.cfg.flashSize / 2);
+    const flashMat = new THREE.MeshBasicMaterial({ color: cfg.palette.flash });
+    for (let i = 0; i < this.cfg.flashPool; i++) {
+      const mesh = new THREE.Mesh(flashGeo, flashMat);
+      mesh.visible = false;
+      this.group.add(mesh);
+      this.flashes.push({ mesh, t: 0 });
+    }
+
+    // Трассеры: тонкие полупрозрачные следы пуль. Геометрия — единичный отрезок
+    // вдоль +z от начала координат, меш растягивается масштабом до дальности выстрела.
+    this.tracers = [];
+    this.tracerNext = 0;
+    const tracerGeo = new THREE.BoxGeometry(this.cfg.tracerSize, this.cfg.tracerSize, 1);
+    tracerGeo.translate(0, 0, 0.5);
+    const tracerMat = new THREE.MeshBasicMaterial({
+      color: cfg.palette.tracer, transparent: true, opacity: 0.45, depthWrite: false,
+    });
+    for (let i = 0; i < this.cfg.tracerPool; i++) {
+      const mesh = new THREE.Mesh(tracerGeo, tracerMat);
+      mesh.visible = false;
+      this.group.add(mesh);
+      this.tracers.push({ mesh, t: 0 });
+    }
   }
 
   // Сноп искр в точке попадания; dir — направление выстрела (искры летят назад).
@@ -49,6 +78,43 @@ export class Impacts {
     return n;
   }
 
+  get flashCount() {
+    let n = 0;
+    for (const f of this.flashes) if (f.t > 0) n++;
+    return n;
+  }
+
+  get tracerCount() {
+    let n = 0;
+    for (const t of this.tracers) if (t.t > 0) n++;
+    return n;
+  }
+
+  // Вспышка выстрела в точке ствола: короткий яркий кристалл.
+  flash(pos) {
+    const f = this.flashes[this.flashNext];
+    this.flashNext = (this.flashNext + 1) % this.flashes.length;
+    f.t = this.cfg.flashLife;
+    f.mesh.visible = true;
+    f.mesh.position.copy(pos);
+    f.mesh.scale.setScalar(1.6); // вспыхивает большим — и сжимается за flashLife
+  }
+
+  // След пули от ствола до точки: попадание — обрывается в игроке, промах — летит мимо.
+  tracer(from, to) {
+    const f = this.tracers[this.tracerNext];
+    this.tracerNext = (this.tracerNext + 1) % this.tracers.length;
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    const dz = to.z - from.z;
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
+    f.mesh.position.copy(from);
+    f.mesh.lookAt(to.x, to.y, to.z); // у мешей локальное +z смотрит в цель
+    f.mesh.scale.set(1, 1, dist);
+    f.mesh.visible = true;
+    f.t = this.cfg.tracerLife;
+  }
+
   update(dt) {
     for (const u of this.units) {
       if (u.life <= 0) continue;
@@ -61,6 +127,21 @@ export class Impacts {
       u.mesh.position.addScaledVector(u.vel, dt);
       const s = Math.max(0.3, u.life / this.cfg.life);
       u.mesh.scale.setScalar(s);
+    }
+    for (const f of this.flashes) {
+      if (f.t <= 0) continue;
+      f.t -= dt;
+      if (f.t <= 0) {
+        f.mesh.visible = false;
+        continue;
+      }
+      const k = f.t / this.cfg.flashLife;
+      f.mesh.scale.setScalar(0.5 + 1.1 * k); // гаснет и сжимается
+    }
+    for (const t of this.tracers) {
+      if (t.t <= 0) continue;
+      t.t -= dt;
+      if (t.t <= 0) t.mesh.visible = false;
     }
   }
 }

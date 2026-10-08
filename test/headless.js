@@ -9,9 +9,10 @@ import { Rocks } from '../src/world/rocks.js';
 import { Bushes } from '../src/world/bushes.js';
 import { Bins } from '../src/world/bins.js';
 import { TrashBags, pushBagsByBins } from '../src/world/bags.js';
+import { Npcs, buildCovers } from '../src/world/npc.js';
 import { createHeightmap } from '../src/world/heightmap.js';
 import { resolveCircleAabb, groundHeightAt } from '../src/core/collide.js';
-import { Player } from '../src/player/player.js';
+import { Player, hurtKick } from '../src/player/player.js';
 import { Viewmodel } from '../src/player/viewmodel.js';
 import { Impacts } from '../src/world/impacts.js';
 
@@ -71,8 +72,13 @@ const inBuilding = (x, z, margin = 0) => layout.buildings.some((b) =>
   Math.abs(x - b.x) < b.w / 2 + margin && Math.abs(z - b.z) < b.d / 2 + margin);
 check('деревья не в домах', layout.trees.every((t) => !inBuilding(t.x, t.z, 1.5)));
 check('деревья в границах', layout.trees.every((t) => Math.abs(t.x) < cfg.world.size / 2 && Math.abs(t.z) < cfg.world.size / 2));
-check('манекены на земле и не в домах', layout.dummies.length === cfg.layout.dummies &&
-  layout.dummies.every((d) => !inBuilding(d.x, d.z, 1) && d.y === hm.heightAt(d.x, d.z)));
+check('нпс достаточно и все в городе', layout.npcs.length === cfg.layout.npcs && layout.npcs.every((n) =>
+  n.x > layout.city.minX && n.x < layout.city.maxX && n.z > layout.city.minZ && n.z < layout.city.maxZ));
+const npcLift = makeCityLift(cfg, layout.buildings);
+check('нпс на покрытии, не в домах', layout.npcs.every((n) =>
+  !inBuilding(n.x, n.z, 1) && Math.abs(n.y - (hm.heightAt(n.x, n.z) + npcLift(n.x, n.z))) < 1e-6));
+check('нпс делятся на палочников и стрелков', layout.npcs.filter((n) => n.weapon === 'stick').length >= 6 &&
+  layout.npcs.filter((n) => n.weapon === 'pistol').length >= 6);
 
 // ---------- C. Коллизии ----------
 console.log('\nC. Коллизии');
@@ -150,6 +156,24 @@ check('не покидает границы мира', Math.hypot(player.pos.x, 
   `r=${Math.hypot(player.pos.x, player.pos.z).toFixed(1)}`);
 check('высота в разумных пределах', player.pos.y < 80 && Number.isFinite(player.pos.y), `y=${player.pos.y.toFixed(1)}`);
 
+// урон от NPC: hp падает и регенерирует; смерть возвращает на спавн
+keys.forward = false;
+player.damage(30);
+check('урон снимает hp', Math.abs(player.hp - 70) < 1e-6, `hp=${player.hp}`);
+stepN(840); // 7 с: 5 с паузы регена + 2 с восстановления
+check('hp восстанавливается после паузы', player.hp > 70, `hp=${player.hp.toFixed(1)}`);
+player.damage(999);
+check('смерть — респавн с полным hp', player.hp === CONFIG.player.maxHp &&
+  Math.hypot(player.pos.x, player.pos.z) < 0.01);
+
+// качение камеры: сторона удара задаёт знаки рывков (взгляд — на -z)
+const kRight = hurtKick(player.pos.x + 1, player.pos.z, player.pos.x, player.pos.z, 0, -1, CONFIG.player.hurt);
+const kBack = hurtKick(player.pos.x, player.pos.z + 1, player.pos.x, player.pos.z, 0, -1, CONFIG.player.hurt);
+const kFront = hurtKick(player.pos.x, player.pos.z - 1, player.pos.x, player.pos.z, 0, -1, CONFIG.player.hurt);
+check('удар справа качнёт камеру влево с креном', kRight.yaw > 0 && kRight.roll > 0 && kRight.pitch === 0);
+check('удар сзади качнёт камеру вниз', kBack.pitch < 0);
+check('удар спереди качнёт камеру вверх', kFront.pitch > 0);
+
 // ---------- E. Предметы в руках и стрельба ----------
 console.log('\nE. Предметы в руках');
 const vm = new Viewmodel(CONFIG);
@@ -179,11 +203,27 @@ check('интервал не меньше cooldown', minGap >= CONFIG.pistol.fir
 
 // искры от попаданий
 const imp = new Impacts(CONFIG);
-check('пул искр создан и спит', imp.group.children.length === CONFIG.impacts.pool && imp.activeCount === 0);
+check('пул искр, вспышек и следов создан и спит',
+  imp.group.children.length === CONFIG.impacts.pool + CONFIG.impacts.flashPool + CONFIG.impacts.tracerPool &&
+  imp.activeCount === 0);
 imp.spawn(new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0, -1));
 check('попадание рождает искры', imp.activeCount === CONFIG.impacts.sparks, `active=${imp.activeCount}`);
 for (let i = 0; i < 120; i++) imp.update(1 / 120);
 check('искры догорают за life', imp.activeCount === 0);
+
+// вспышки выстрелов NPC: ярко вспыхивают и гаснут быстро
+check('вспышки спят на старте', imp.flashCount === 0);
+imp.flash(new THREE.Vector3(0, 1.5, 0));
+check('выстрел NPC рождает яркую вспышку', imp.flashCount === 1);
+for (let i = 0; i < Math.ceil(CONFIG.impacts.flashLife * 120) + 2; i++) imp.update(1 / 120);
+check('вспышка гаснет за flashLife', imp.flashCount === 0);
+
+// следы пуль: мелькают и гаснут быстро
+check('следы пуль спят на старте', imp.tracerCount === 0);
+imp.tracer(new THREE.Vector3(0, 1.5, 0), new THREE.Vector3(0, 1.5, -10));
+check('выстрел оставляет след от ствола', imp.tracerCount === 1);
+for (let i = 0; i < Math.ceil(CONFIG.impacts.tracerLife * 120) + 2; i++) imp.update(1 / 120);
+check('след гаснет за tracerLife', imp.tracerCount === 0);
 
 // ---------- F. Городская зона, зелень и камни ----------
 console.log('\nF. Городская зона, зелень и улица');
@@ -333,6 +373,147 @@ check('бак столкнул мешок', soloMoved && soloBag.awakeCount === 
 
 binsView.resetAll();
 check('R возвращает баки на места', binsView.units[0].pos.distanceTo(binStart) < 0.05);
+
+// ---------- G. NPC: зоны контакта ----------
+console.log('\nG. NPC');
+const covers = buildCovers(cfg, layout);
+check('укрытия собраны в грид (дома, валуны, стволы)', covers.grid.size > 0 && covers.city !== null);
+
+const npcWorld = { heightmap: hm, colliders: [], size: cfg.world.size, cityLift: null };
+const emptyCovers = { grid: new Map(), cell: 8, city: null };
+const mkHooks = () => {
+  const ev = { dmg: [], shots: 0, tracers: 0 };
+  return {
+    ev,
+    hooks: {
+      playerDamage: (d) => ev.dmg.push(d),
+      muzzle: () => { ev.shots++; },
+      tracer: () => { ev.tracers++; },
+    },
+  };
+};
+
+// игрок далеко: NPC не замечают его
+const far = mkHooks();
+const crowd = new Npcs([
+  { x: 0, z: 0, y: 0, rot: 0, weapon: 'stick', home: { x: 0, z: 0 } },
+  { x: 0, z: 10, y: 0, rot: 0, weapon: 'pistol', home: { x: 0, z: 10 } },
+], CONFIG, npcWorld, emptyCovers);
+check('NPC живут одним набором instanced-мешей', crowd.parts.length === 4 && crowd.body.count === 2);
+const farPlayer = new THREE.Vector3(0, 0, 60);
+for (let i = 0; i < 600; i++) crowd.update(1 / 60, farPlayer, far.hooks);
+check('зона вне видимости: игрока игнорируют', crowd.alertCount === 0 && far.ev.dmg.length === 0 && far.ev.shots === 0);
+
+// контакт: палочник дожимает и бьёт, стрелок пристреливается
+const fight = mkHooks();
+const nearPlayer = new THREE.Vector3(0, 0, 5);
+let prevShots = 0;
+let maxPerSec = 0;
+for (let i = 0; i < 1200; i++) {
+  crowd.update(1 / 60, nearPlayer, fight.hooks);
+  if (i % 60 === 59) {
+    maxPerSec = Math.max(maxPerSec, fight.ev.shots - prevShots); // пик выстрелов за секунду
+    prevShots = fight.ev.shots;
+  }
+}
+check('контакт: NPC перешли в агрессию', crowd.alertCount === 2);
+check('палочник бьёт палкой', fight.ev.dmg.includes(CONFIG.npc.attackDamage), `hits=${fight.ev.dmg.length}`);
+check('стрелок стреляет по игроку', fight.ev.shots > 0 && fight.ev.dmg.includes(CONFIG.npc.shotDamage));
+check('стреляет очередями 2+ выстрела подряд', maxPerSec >= 2, `max=${maxPerSec}/с`);
+check('каждый выстрел оставляет след пули', fight.ev.tracers === fight.ev.shots, `t=${fight.ev.tracers}/${fight.ev.shots}`);
+
+// игрок ушёл из вида: ищут его у последнего места контакта
+nearPlayer.set(0, 0, 80);
+for (let i = 0; i < 60; i++) crowd.update(1 / 60, nearPlayer, fight.hooks); // дать заметить пропажу
+const hitsBefore = fight.ev.dmg.length;
+for (let i = 0; i < 1800; i++) crowd.update(1 / 60, nearPlayer, fight.hooks);
+const stickUnit = crowd.units[0];
+const distToSeen = Math.hypot(stickUnit.pos.x, stickUnit.pos.z - 5);
+check('после потери из вида ищут игрока в месте находки', crowd.alertCount === 2 && distToSeen < 14,
+  `d=${distToSeen.toFixed(1)}`);
+check('вне видимости новых атак нет', fight.ev.dmg.length === hitsBefore);
+
+// стена между стрелком и игроком: ни обнаружения, ни выстрелов
+const wallCovers = buildCovers(cfg, { buildings: [{ x: 10, z: 0, w: 8, d: 12 }], rocks: [], trees: [], city: null });
+const sneak = mkHooks();
+const gunner = new Npcs([
+  { x: 0, z: 0, y: 0, rot: 0, weapon: 'pistol', home: { x: 0, z: 0 } },
+], CONFIG, npcWorld, wallCovers);
+const hiddenPlayer = new THREE.Vector3(20, 0, 0);
+for (let i = 0; i < 1200; i++) gunner.update(1 / 60, hiddenPlayer, sneak.hooks);
+check('стена скрывает игрока от NPC', gunner.alertCount === 0 && sneak.ev.shots === 0 && sneak.ev.dmg.length === 0);
+
+// игрок спрятался за домом во время боя: стрелок обходит угол и ведёт огонь
+const peekCovers = buildCovers(cfg, { buildings: [{ x: 5, z: 0, w: 3, d: 4 }], rocks: [], trees: [], city: null });
+const peeka = mkHooks();
+const hider = new Npcs([
+  { x: 0, z: 3.5, y: 0, rot: 0, weapon: 'pistol', home: { x: 0, z: 3.5 } },
+], CONFIG, npcWorld, peekCovers);
+const peekPlayer = new THREE.Vector3(9, 0, 3.5);
+for (let i = 0; i < 60; i++) hider.update(1 / 60, peekPlayer, peeka.hooks); // заметил игрока
+peekPlayer.set(9, 0, 0); // игрок спрятался за домом
+let peekMinCover = Infinity;
+for (let i = 0; i < 3600; i++) {
+  hider.update(1 / 60, peekPlayer, peeka.hooks);
+  const u = hider.units[0];
+  if (u.cover) peekMinCover = Math.min(peekMinCover, Math.hypot(u.cover.x - u.pos.x, u.cover.z - u.pos.z));
+}
+check('выглядывает из-за укрытия и ведёт огонь', peeka.ev.shots >= 8 && peeka.ev.dmg.includes(CONFIG.npc.shotDamage),
+  `shots=${peeka.ev.shots} dmg=${peeka.ev.dmg.length}`);
+check('отстрелялся — прячется назад за укрытие', peekMinCover < 1.2, `minD=${peekMinCover.toFixed(2)}`);
+
+// на дистанции стрелки мажут: игрок держит 20 м, часть пуль летит мимо
+const afar = mkHooks();
+const sniper = new Npcs([
+  { x: 0, z: 0, y: 0, rot: 0, weapon: 'pistol', home: { x: 0, z: 0 } },
+], CONFIG, npcWorld, emptyCovers);
+const farTarget = new THREE.Vector3(0, 0, 20);
+for (let i = 0; i < 3600; i++) {
+  farTarget.set(sniper.units[0].pos.x, 0, sniper.units[0].pos.z + 20); // игрок держит дистанцию
+  sniper.update(1 / 60, farTarget, afar.hooks);
+}
+const farHits = afar.ev.dmg.filter((d) => d === CONFIG.npc.shotDamage).length;
+check('на дистанции бывают промахи', afar.ev.shots > farHits && farHits > 0,
+  `shots=${afar.ev.shots} hits=${farHits}`);
+check('промахи тоже оставляют следы', afar.ev.tracers === afar.ev.shots, `t=${afar.ev.tracers}/${afar.ev.shots}`);
+
+// палочник не застревает на баках: «щупальце» видит бак и обходит его
+const binWorld = { heightmap: hm, colliders: [], size: cfg.world.size, cityLift: null,
+  bins: { units: [{ pos: new THREE.Vector3(0, 0, 5) }] } };
+const detour = mkHooks();
+const walker = new Npcs([
+  { x: 0, z: 0, y: 0, rot: 0, weapon: 'stick', home: { x: 0, z: 0 } },
+], CONFIG, binWorld, emptyCovers);
+const walkTarget = new THREE.Vector3(0, 0, 10);
+for (let i = 0; i < 900; i++) walker.update(1 / 60, walkTarget, detour.hooks);
+const wu = walker.units[0];
+const wd = Math.hypot(wu.pos.x, wu.pos.z - 10);
+check('палочник обходит мусорный бак', wu.pos.z > 5 && wd < 3.5,
+  `z=${wu.pos.z.toFixed(1)} d=${wd.toFixed(1)}`);
+
+// смерть и воскрешение по R
+const duel = mkHooks();
+const lone = new Npcs([
+  { x: 0, z: 0, y: 0, rot: 0, weapon: 'stick', home: { x: 0, z: 0 } },
+], CONFIG, npcWorld, emptyCovers);
+const duelPlayer = new THREE.Vector3(0, 0, 2.6);
+for (let i = 0; i < 240; i++) lone.update(1 / 60, duelPlayer, duel.hooks);
+check('палочник бьёт в упор', duel.ev.dmg.length > 0, `hits=${duel.ev.dmg.length}`);
+const duelHits = duel.ev.dmg.length;
+lone.hit(0, { x: 0, z: 1 }, { damage: 999, knockback: 2 }, duelPlayer);
+check('смертельный удар валит NPC', lone.aliveCount === 0);
+for (let i = 0; i < 240; i++) lone.update(1 / 60, duelPlayer, duel.hooks);
+check('мёртвый NPC не атакует', duel.ev.dmg.length === duelHits);
+lone.resetAll();
+check('R возвращает NPC в строй', lone.aliveCount === 1 && lone.units[0].hp === CONFIG.npc.hp);
+
+// городские NPC: спокойны на старте и патрулируют только в городе
+const npcsView = new Npcs(layout.npcs, CONFIG, { ...npcWorld, cityLift }, covers);
+check('городские NPC спокойны на старте', npcsView.aliveCount === cfg.layout.npcs && npcsView.alertCount === 0);
+for (let i = 0; i < 600; i++) npcsView.update(1 / 60, new THREE.Vector3(0, 0, 0), far.hooks);
+check('патруль не выходит из города', npcsView.units.every((u) =>
+  u.pos.x > cityZone.minX - 1 && u.pos.x < cityZone.maxX + 1 &&
+  u.pos.z > cityZone.minZ - 1 && u.pos.z < cityZone.maxZ + 1));
 
 // ---------- Итог ----------
 console.log(`\nИтог: ${pass} ok, ${fail} FAIL`);

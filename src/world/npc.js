@@ -1,0 +1,813 @@
+import * as THREE from 'three';
+import { resolveCircleAabb } from '../core/collide.js';
+import { mulberry32 } from '../core/noise.js';
+import { mergeGeometries } from './merge.js';
+
+const UP = new THREE.Vector3(0, 1, 0);
+const X_AXIS = new THREE.Vector3(1, 0, 0);
+const ONE = new THREE.Vector3(1, 1, 1);
+const HAND = { x: 0.34, y: 1.02, z: 0.16 }; // кисть правой руки: сюда крепится оружие
+const FALL_TIME = 0.45; // сколько NPC заваливается после смерти, с
+const noop = () => {};
+
+// NPC: три зоны контакта с игроком —
+//   1) близко: агрессия — палка бьёт, пистолет стреляет в упор;
+//   2) средне: сближение; стрелки ищут, за чем спрятаться (стена, валун, ствол),
+//      выбегают на очередь 2–4 выстрела (с разбросом — мажут), отстрелялись —
+//      прячутся за угол и через паузу выбегают снова;
+//   3) вне видимости: реакции нет; если контакт уже был — ищут игрока у последнего
+//      места и патрулируют район находки.
+// Живут в городе: патруль крутится вокруг дома. Рисуются одним набором
+// instanced-мешей (тело, голова, палки, пистолеты) — 20 NPC стоят почти как один.
+export class Npcs {
+  constructor(list, cfg, world, covers) {
+    this.cfg = cfg.npc;
+    this.world = world; // { heightmap, colliders, size, cityLift }
+    this.covers = covers || { grid: new Map(), cell: 8, city: null };
+    this.rng = mulberry32(((cfg.seed | 0) ^ 0x5bd1e995) >>> 0);
+    this.fullHp = cfg.npc.hp;
+    this.units = [];
+    // баки — живые коллайдеры вне грида укрытий: «щупальце» и патруль должны их видеть
+    this.binList = (world.bins && world.bins.units) || null;
+
+    // --- меши: тело и голова — на каждого, палки и пистолеты — по типу оружия
+    const nStick = list.filter((it) => it.weapon !== 'pistol').length;
+    this.body = new THREE.InstancedMesh(makeBodyGeometry(), new THREE.MeshLambertMaterial({ color: cfg.palette.npcBody, flatShading: true }), list.length);
+    this.head = new THREE.InstancedMesh(makeHeadGeometry(), new THREE.MeshLambertMaterial({ color: cfg.palette.npcHead, flatShading: true }), list.length);
+    this.sticks = new THREE.InstancedMesh(makeStickGeometry(), new THREE.MeshLambertMaterial({ color: cfg.palette.trunk, flatShading: true }), nStick);
+    this.guns = new THREE.InstancedMesh(makeGunGeometry(), new THREE.MeshLambertMaterial({ color: cfg.palette.npcGun, flatShading: true }), list.length - nStick);
+    this.parts = [this.body, this.head, this.sticks, this.guns];
+    for (const m of this.parts) {
+      m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      m.frustumCulled = false; // NPC ходят: коробка отсечения меша тут не годится
+      m.userData.npc = true;   // хитсякану: попал в NPC — instanceId и есть его номер
+    }
+
+    this._q = new THREE.Quaternion();
+    this._qa = new THREE.Quaternion();
+    this._p = new THREE.Vector3();
+    this._m = new THREE.Matrix4();
+    this._mHand = new THREE.Matrix4();
+    this._mRot = new THREE.Matrix4();
+    this._mPart = new THREE.Matrix4();
+    this._c = new THREE.Color();
+    this._t1 = new THREE.Vector3(); // разброс выстрела: направление и поперечины
+    this._t2 = new THREE.Vector3();
+    this._t3 = new THREE.Vector3();
+
+    let wiStick = 0;
+    let wiGun = 0;
+    list.forEach((it, i) => {
+      const u = {
+        pos: new THREE.Vector3(it.x, it.y !== undefined ? it.y : this.groundAt(it.x, it.z), it.z),
+        vel: new THREE.Vector3(), // только отдача от ударов игрока
+        yaw: it.rot || 0,
+        rot: it.rot || 0,
+        home: { x: it.home ? it.home.x : it.x, z: it.home ? it.home.z : it.z },
+        weapon: it.weapon === 'pistol' ? 'pistol' : 'stick',
+        wi: 0, // слот внутри своего меша оружия
+        hp: this.fullHp,
+        dead: false,
+        fall: 0,
+        aware: false,      // был ли контакт с игроком
+        sees: false,       // видит ли прямо сейчас (обновляется на «думании»)
+        state: 'patrol',   // patrol | close | medium | search
+        lastKnown: null,   // где видел игрока в последний раз
+        searchCenter: null, // район поиска после потери из вида
+        cover: null,       // точка за укрытием (стрелки)
+        coverFrom: { x: 0, z: 0 }, // откуда игрок смотрел при выборе укрытия
+        peek: null,        // точка у края укрытия, откуда выглядываем и стреляем
+        peekSide: 1,       // сторона выгляда: держимся одной, чтобы не метаться
+        hideT: 0,          // сколько уже пережидает за укрытием без боя
+        target: null,
+        pauseT: 0,
+        thinkT: this.rng() * this.cfg.thinkInterval,
+        swingT: 0,
+        swingDone: true,
+        shotT: 0,
+        aimT: 0,
+        gunT: 0,
+        burstLeft: 0, // выстрелов осталось в текущей очереди
+      };
+      u.wi = u.weapon === 'pistol' ? wiGun++ : wiStick++;
+      this.units.push(u);
+
+      this._c.set(cfg.palette.npcBody).multiplyScalar(0.8 + this.rng() * 0.45); // у каждого свой оттенок куртки
+      this.body.setColorAt(i, this._c);
+    });
+    if (this.body.instanceColor) this.body.instanceColor.needsUpdate = true;
+
+    for (let i = 0; i < this.units.length; i++) this._compose(i);
+    for (const m of this.parts) m.instanceMatrix.needsUpdate = true;
+  }
+
+  get aliveCount() {
+    let n = 0;
+    for (const u of this.units) if (!u.dead) n++;
+    return n;
+  }
+
+  get alertCount() {
+    let n = 0;
+    for (const u of this.units) if (u.aware && !u.dead) n++;
+    return n;
+  }
+
+  addTo(scene) {
+    for (const m of this.parts) scene.add(m);
+  }
+
+  groundAt(x, z) {
+    const lift = this.world.cityLift ? this.world.cityLift(x, z) : 0;
+    return this.world.heightmap.heightAt(x, z) + lift;
+  }
+
+  // Удар игрока: толчок, урон и мгновенная осведомлённость — откуда прилетело.
+  hit(i, dir, imp, fromPos) {
+    const u = this.units[i];
+    if (!u || u.dead) return false;
+    u.vel.x += dir.x * (imp.knockback || 0);
+    u.vel.z += dir.z * (imp.knockback || 0);
+    u.aware = true;
+    if (fromPos) u.lastKnown = { x: fromPos.x, z: fromPos.z };
+    u.hp -= imp.damage || 0;
+    if (u.hp <= 0) {
+      u.hp = 0;
+      u.dead = true;
+      u.sees = false;
+      u.target = null;
+    }
+    return true;
+  }
+
+  update(dt, playerPos, hooks) {
+    const onDamage = (hooks && hooks.playerDamage) || noop;
+    const onMuzzle = (hooks && hooks.muzzle) || noop;
+    const onTracer = (hooks && hooks.tracer) || noop;
+    for (const u of this.units) {
+      if (u.dead) {
+        u.fall = Math.min(1, u.fall + dt / FALL_TIME); // заваливается и остаётся лежать
+        continue;
+      }
+      u.thinkT -= dt;
+      if (u.thinkT <= 0) {
+        this._think(u, playerPos);
+        u.thinkT = this.cfg.thinkInterval * (0.75 + this.rng() * 0.5); // решения вразнобой
+      }
+      this._move(u, dt, playerPos);
+      this._act(u, dt, playerPos, onDamage, onMuzzle, onTracer);
+    }
+    this._separate();
+    for (let i = 0; i < this.units.length; i++) this._compose(i);
+    for (const m of this.parts) m.instanceMatrix.needsUpdate = true;
+  }
+
+  // Решение по зонам контакта; вызывается раз в thinkInterval.
+  _think(u, p) {
+    const c = this.cfg;
+    const dist = Math.hypot(p.x - u.pos.x, p.z - u.pos.z);
+    const visible = dist <= c.visionRange && this._los(u.pos.x, u.pos.z, p.x, p.z);
+    u.sees = visible;
+    if (visible) {
+      u.aware = true;
+      u.lastKnown = { x: p.x, z: p.z }; // вижу — запоминаю, где игрок
+      u.hideT = 0;
+    }
+    if (!u.aware) {
+      u.state = 'patrol';
+      return;
+    }
+
+    if (visible && dist <= c.closeRange) {
+      // близкий контакт: палочник дожимает и бьёт, стрелок ведёт очередь
+      u.state = 'close';
+      if (u.weapon === 'stick') {
+        u.cover = null;
+        u.peek = null;
+        u.target = { x: p.x, z: p.z };
+        return;
+      }
+      // стрелок в упор: отстрелялся — шаг назад к укрытию, потом выглядывает снова
+      if (!u.cover) {
+        u.cover = this._pickCover(u, p);
+        u.coverFrom = { x: p.x, z: p.z };
+        u.peek = null;
+      }
+      u.target = u.burstLeft > 0 || !u.cover ? null : { x: u.cover.x, z: u.cover.z };
+      return;
+    }
+    if (visible) {
+      // средний контакт: сближение; стрелки уходят за укрытие и ведут пристрелку
+      u.state = 'medium';
+      if (u.weapon === 'pistol') {
+        if (u.cover && (Math.abs(p.x - u.coverFrom.x) > 6 || Math.abs(p.z - u.coverFrom.z) > 6)) {
+          u.cover = null;
+          u.peek = null;
+        }
+        if (!u.cover) {
+          u.cover = this._pickCover(u, p);
+          u.coverFrom = { x: p.x, z: p.z };
+          u.peek = null;
+        }
+        // на огневой позиции: в очереди — стоим и стреляем, отстрелялись — прячемся назад
+        const atCover = u.cover && Math.hypot(u.cover.x - u.pos.x, u.cover.z - u.pos.z) < 1.2;
+        const atPeek = u.peek && Math.hypot(u.peek.x - u.pos.x, u.peek.z - u.pos.z) < 0.9;
+        if (!u.cover) u.target = { x: p.x, z: p.z };
+        else if (atPeek && u.burstLeft <= 0) u.target = { x: u.cover.x, z: u.cover.z };
+        else if (atCover || atPeek) u.target = null;
+        else if (u.shotT <= 0 && u.peek && this._los(u.peek.x, u.peek.z, p.x, p.z)) {
+          // держим курс на уголок до конца: мелькнувшая по пути видимость не разворачивает
+          u.target = { x: u.peek.x, z: u.peek.z };
+        } else u.target = { x: u.cover.x, z: u.cover.z };
+      } else {
+        u.target = { x: p.x, z: p.z };
+      }
+      return;
+    }
+    // вне видимости: контакт уже был — стрелки выглядывают, остальные ищут игрока
+    u.state = 'search';
+    const hide = u.cover ? Math.hypot(u.cover.x - u.pos.x, u.cover.z - u.pos.z) : Infinity;
+    if (u.weapon === 'pistol' && u.cover && dist <= c.visionRange && u.shotT <= 0) {
+      // уже выглядываем: держим курс на уголок, пока он видит игрока — бросок
+      // к углу не должен срываться на полпути из-за отрыва от укрытия
+      if (u.peek && this._los(u.peek.x, u.peek.z, p.x, p.z)) {
+        u.target = { x: u.peek.x, z: u.peek.z };
+        return;
+      }
+      // новый выгляд — только из-за самого укрытия
+      if (hide < 2.2) {
+        const peek = this._pickPeek(u, p);
+        if (peek) {
+          u.peek = peek;
+          u.hideT = 0;
+          u.target = { x: peek.x, z: peek.z };
+          return;
+        }
+      }
+    }
+    u.peek = null;
+    if (hide < 8) {
+      // по пути к укрытию или уже там: добегаем и пережидаем
+      u.hideT += c.thinkInterval;
+      if (u.hideT < c.hideWait) {
+        u.target = { x: u.cover.x, z: u.cover.z };
+        return;
+      }
+    }
+    u.hideT = 0;
+    u.cover = null;
+    u.target = u.lastKnown ? { x: u.lastKnown.x, z: u.lastKnown.z } : null;
+  }
+
+  _move(u, dt, p) {
+    const c = this.cfg;
+    u.pauseT = Math.max(0, u.pauseT - dt);
+
+    // патрульная точка, когда идти некуда (спокойный обход или поиск)
+    if (!u.target && u.pauseT <= 0 && (u.state === 'patrol' || u.state === 'search')) {
+      u.target = this._pickPatrol(u.aware ? (u.searchCenter || u.home) : u.home);
+    }
+
+    let dirx = 0;
+    let dirz = 0;
+    if (u.target) {
+      const dx = u.target.x - u.pos.x;
+      const dz = u.target.z - u.pos.z;
+      const d = Math.hypot(dx, dz);
+      // к точке выгляда подходим вплотную: стрельба идёт точно с края укрытия
+      const arrive = u.peek && Math.abs(u.target.x - u.peek.x) < 1e-9 && Math.abs(u.target.z - u.peek.z) < 1e-9 ? 0.25 : 0.8;
+      if (d < arrive) {
+        // дошли: последнее место игрока стало районом поиска
+        if (u.lastKnown && Math.abs(u.target.x - u.lastKnown.x) < 1e-6 && Math.abs(u.target.z - u.lastKnown.z) < 1e-6) {
+          u.searchCenter = u.lastKnown;
+          u.lastKnown = null;
+        }
+        u.target = null;
+        u.pauseT = 0.7 + this.rng() * 2;
+      } else {
+        dirx = dx / d;
+        dirz = dz / d;
+        // палочник в ближней зоне не влезает в игрока — бьёт с дистанции
+        if (u.state === 'close' && u.weapon === 'stick' && d <= c.attackRange * 0.8) dirx = dirz = 0;
+      }
+    }
+
+    // «щупальце» вперёд: упёрлись в стену или бак — ищем свободный обходной поворот
+    if (dirx || dirz) {
+      const ahead = 1.3;
+      if (this._blocked(u.pos.x + dirx * ahead, u.pos.z + dirz * ahead)) {
+        let free = false;
+        for (const a of [0.9, -0.9, 1.7, -1.7, 2.4, -2.4]) {
+          const ca = Math.cos(a);
+          const sa = Math.sin(a);
+          const rx = dirx * ca - dirz * sa;
+          const rz = dirx * sa + dirz * ca;
+          if (!this._blocked(u.pos.x + rx * ahead, u.pos.z + rz * ahead)) {
+            dirx = rx;
+            dirz = rz;
+            free = true;
+            break;
+          }
+        }
+        if (!free) dirx = dirz = 0;
+      }
+    }
+
+    const speed = u.aware ? c.chaseSpeed : c.walkSpeed;
+    u.pos.x += dirx * speed * dt;
+    u.pos.z += dirz * speed * dt;
+
+    // отдача от ударов игрока
+    u.pos.x += u.vel.x * dt;
+    u.pos.z += u.vel.z * dt;
+    const damp = Math.exp(-7 * dt);
+    u.vel.x *= damp;
+    u.vel.z *= damp;
+
+    // стены, дома, баки — то же выталкивание, что у игрока
+    const res = resolveCircleAabb(u.pos.x, u.pos.z, c.radius, u.pos.y, 1.7, this.world.colliders);
+    if (res.hit) {
+      u.pos.x = res.x;
+      u.pos.z = res.z;
+    }
+
+    const lim = this.world.size / 2 - 3;
+    u.pos.x = Math.max(-lim, Math.min(lim, u.pos.x));
+    u.pos.z = Math.max(-lim, Math.min(lim, u.pos.z));
+    u.pos.y = this.groundAt(u.pos.x, u.pos.z);
+
+    // разворот: в бою смотрим на игрока, в патруле — по ходу движения
+    let want = null;
+    if (u.aware) want = Math.atan2(p.x - u.pos.x, p.z - u.pos.z);
+    else if (dirx || dirz) want = Math.atan2(dirx, dirz);
+    if (want !== null) {
+      const delta = Math.atan2(Math.sin(want - u.yaw), Math.cos(want - u.yaw));
+      const mx = c.turnSpeed * dt;
+      u.yaw += Math.abs(delta) <= mx ? delta : Math.sign(delta) * mx;
+    }
+  }
+
+  // Атаки: палка — взмах с уроном в середине дуги; пистолет — очереди 2–4 выстрела.
+  _act(u, dt, p, onDamage, onMuzzle, onTracer) {
+    const c = this.cfg;
+    const dist = Math.hypot(p.x - u.pos.x, p.z - u.pos.z);
+    if (u.weapon === 'stick') {
+      if (u.swingT > 0) {
+        u.swingT = Math.max(0, u.swingT - dt);
+        const progress = 1 - u.swingT / c.swingTime;
+        if (!u.swingDone && progress >= 0.45 && u.sees && dist <= c.attackRange + 0.3) {
+          u.swingDone = true;
+          onDamage(c.attackDamage, u.pos); // палка достала игрока — оттуда и удар
+        }
+      }
+      u.shotT = Math.max(0, u.shotT - dt);
+      if (u.sees && u.state === 'close' && dist <= c.attackRange && u.swingT <= 0 && u.shotT <= 0) {
+        u.swingT = c.swingTime;
+        u.swingDone = false;
+        u.shotT = c.attackCooldown;
+      }
+    } else {
+      u.shotT = Math.max(0, u.shotT - dt);
+      u.gunT = Math.max(0, u.gunT - dt);
+      const canShoot = u.aware && u.sees && dist <= c.shotRange;
+      if (!canShoot) {
+        u.aimT = 0;
+        u.burstLeft = 0; // цель потеряна — очередь прервана
+      } else {
+        if (u.burstLeft <= 0 && u.shotT <= 0) {
+          // новая очередь: 2–4 выстрела подряд
+          u.burstLeft = c.burstMin + Math.floor(this.rng() * (c.burstMax - c.burstMin + 1));
+          u.aimT = 0;
+        }
+        if (u.burstLeft > 0) {
+          u.aimT += dt; // пристрелка — только перед первым выстрелом очереди
+          if (u.aimT >= c.aimTime && u.shotT <= 0) this._fire(u, p, dist, onDamage, onMuzzle, onTracer);
+        }
+      }
+    }
+  }
+
+  // Выстрел: прицел в грудь игрока плюс разброс — NPC мажут, и это видно по следу.
+  _fire(u, p, dist, onDamage, onMuzzle, onTracer) {
+    const c = this.cfg;
+    const inv = dist > 1e-6 ? 1 / dist : 0;
+    const mx = u.pos.x + (p.x - u.pos.x) * inv * 0.6;
+    const my = u.pos.y + 1.32;
+    const mz = u.pos.z + (p.z - u.pos.z) * inv * 0.6;
+
+    // базовое направление — в грудь; затем поворот на случайный малый угол
+    const dir = this._t1.set(p.x - mx, p.y + 1.05 - my, p.z - mz).normalize();
+    const spread = Math.tan(c.shotSpread * (this.rng() - 0.5) * 2);
+    const roll = this.rng() * Math.PI * 2;
+    const perp = this._t2.crossVectors(dir, UP).normalize(); // горизонтальная поперечина
+    const rise = this._t3.crossVectors(perp, dir).normalize();
+    dir.addScaledVector(perp, Math.cos(roll) * spread);
+    dir.addScaledVector(rise, Math.sin(roll) * spread);
+    dir.normalize();
+
+    // луч прошёл рядом с «грудью» игрока — попадание; иначе промах мимо
+    const rx = p.x - mx;
+    const ry = p.y + 1.05 - my;
+    const rz = p.z - mz;
+    const tHit = rx * dir.x + ry * dir.y + rz * dir.z;
+    let hit = false;
+    if (tHit > 0 && tHit < c.shotRange) {
+      const ox = rx - dir.x * tHit;
+      const oy = ry - dir.y * tHit;
+      const oz = rz - dir.z * tHit;
+      hit = ox * ox + oy * oy + oz * oz <= c.hitRadius * c.hitRadius;
+    }
+
+    // след пули: оборвался в игроке или улетел мимо него
+    const tEnd = hit ? tHit : Math.min(c.shotRange, dist + 8);
+    onTracer(
+      { x: mx, y: my, z: mz },
+      { x: mx + dir.x * tEnd, y: my + dir.y * tEnd, z: mz + dir.z * tEnd },
+    );
+    onMuzzle({ x: mx, y: my, z: mz }, { x: dir.x, y: dir.y, z: dir.z });
+    if (hit) onDamage(c.shotDamage, u.pos);
+
+    u.burstLeft--;
+    u.shotT = u.burstLeft > 0 ? c.burstInterval : c.burstPause;
+    u.gunT = 0.12;
+    u.aimT = c.aimTime; // очередь идёт без повторной пристрелки
+  }
+
+  // NPC не стоят друг в друге: мягко расталкиваем пары.
+  _separate() {
+    const min = 0.85;
+    for (let i = 0; i < this.units.length; i++) {
+      const a = this.units[i];
+      if (a.dead) continue;
+      for (let j = i + 1; j < this.units.length; j++) {
+        const b = this.units[j];
+        if (b.dead) continue;
+        const dx = b.pos.x - a.pos.x;
+        const dz = b.pos.z - a.pos.z;
+        const d2 = dx * dx + dz * dz;
+        if (d2 >= min * min || d2 < 1e-9) continue;
+        const d = Math.sqrt(d2);
+        const push = (min - d) / 2;
+        const nx = dx / d;
+        const nz = dz / d;
+        a.pos.x -= nx * push;
+        a.pos.z -= nz * push;
+        b.pos.x += nx * push;
+        b.pos.z += nz * push;
+      }
+    }
+  }
+
+  // Преграда под точкой: грид укрытий плюс баки — они живые и в грид не попадают.
+  _blocked(x, z) {
+    if (obstacleAt(this.covers, x, z, this.cfg.radius + 0.15)) return true;
+    const bins = this.binList;
+    if (!bins) return false;
+    const r = this.cfg.radius + 0.4; // бак — круг радиусом с его основание
+    for (let i = 0; i < bins.length; i++) {
+      const dx = bins[i].pos.x - x;
+      const dz = bins[i].pos.z - z;
+      if (dx * dx + dz * dz < r * r) return true;
+    }
+    return false;
+  }
+
+  // Прямая видимость: точный отрезок против прямоугольников и кругов грида.
+  // Короткие срезы у углов точечная проверка могла перескочить — стрелок видел сквозь угол.
+  _los(x0, z0, x1, z1) {
+    const dx = x1 - x0;
+    const dz = z1 - z0;
+    if (dx === 0 && dz === 0) return true;
+    const cell = this.covers.cell;
+    const stamp = (this._losStamp = (this._losStamp | 0) + 1);
+    const gx0 = Math.floor(Math.min(x0, x1) / cell);
+    const gx1 = Math.floor(Math.max(x0, x1) / cell);
+    const gz0 = Math.floor(Math.min(z0, z1) / cell);
+    const gz1 = Math.floor(Math.max(z0, z1) / cell);
+    for (let gx = gx0; gx <= gx1; gx++) {
+      for (let gz = gz0; gz <= gz1; gz++) {
+        const bucket = this.covers.grid.get(gx + ':' + gz);
+        if (!bucket) continue;
+        for (const ob of bucket) {
+          if (ob._lsStamp === stamp) continue; // одно препятствие — один раз
+          ob._lsStamp = stamp;
+          if (this._segHits(ob, x0, z0, dx, dz)) return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  // Отрезок (x0,z0)+t·(dx,dz), t ∈ [0,1], задевает ли препятствие ob.
+  _segHits(ob, x0, z0, dx, dz) {
+    if (ob.rect) {
+      let t0 = 0;
+      let t1 = 1;
+      const minX = ob.x - ob.e1;
+      const maxX = ob.x + ob.e1;
+      const minZ = ob.z - ob.e2;
+      const maxZ = ob.z + ob.e2;
+      if (Math.abs(dx) < 1e-9) {
+        if (x0 < minX || x0 > maxX) return false;
+      } else {
+        let a = (minX - x0) / dx;
+        let b = (maxX - x0) / dx;
+        if (a > b) { const s = a; a = b; b = s; }
+        if (a > t0) t0 = a;
+        if (b < t1) t1 = b;
+        if (t0 > t1) return false;
+      }
+      if (Math.abs(dz) < 1e-9) {
+        if (z0 < minZ || z0 > maxZ) return false;
+      } else {
+        let a = (minZ - z0) / dz;
+        let b = (maxZ - z0) / dz;
+        if (a > b) { const s = a; a = b; b = s; }
+        if (a > t0) t0 = a;
+        if (b < t1) t1 = b;
+        if (t0 > t1) return false;
+      }
+      return true;
+    }
+    // круг: расстояние от центра до отрезка меньше радиуса
+    const len2 = dx * dx + dz * dz;
+    let t = len2 > 1e-12 ? ((ob.x - x0) * dx + (ob.z - z0) * dz) / len2 : 0;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    const cx = x0 + dx * t - ob.x;
+    const cz = z0 + dz * t - ob.z;
+    return cx * cx + cz * cz < ob.e1 * ob.e1;
+  }
+
+  // Укрытие: точка за препятствием с противоположной от игрока стороны.
+  _pickCover(u, p) {
+    const c = this.cfg;
+    let best = null;
+    let bestScore = Infinity;
+    cellsAround(this.covers, u.pos.x, u.pos.z, c.coverRange, (ob) => {
+      let dx = ob.x - p.x;
+      let dz = ob.z - p.z;
+      const d = Math.hypot(dx, dz) || 1;
+      dx /= d;
+      dz /= d;
+      // отходим от игрока через центр препятствия чуть дальше его края
+      let out;
+      if (ob.rect) {
+        const tx = Math.abs(dx) > 1e-6 ? ob.e1 / Math.abs(dx) : Infinity;
+        const tz = Math.abs(dz) > 1e-6 ? ob.e2 / Math.abs(dz) : Infinity;
+        out = Math.min(tx, tz) + 0.7;
+      } else {
+        out = ob.e1 + 0.7;
+      }
+      const sx = ob.x + dx * out;
+      const sz = ob.z + dz * out;
+      const dNpc = Math.hypot(sx - u.pos.x, sz - u.pos.z);
+      if (dNpc > c.coverRange) return;
+      if (obstacleAt(this.covers, sx, sz, 0.3)) return; // место занято другим препятствием
+      const between = Math.hypot(ob.x - p.x, ob.z - p.z) < Math.hypot(u.pos.x - p.x, u.pos.z - p.z);
+      const score = dNpc + (between ? 0 : 8); // укрытие «между нами» приоритетнее
+      if (score < bestScore) {
+        bestScore = score;
+        best = { x: sx, z: sz, ob }; // помним и само препятствие: по нему ищем точку выгляда
+      }
+    });
+    return best;
+  }
+
+  // Точка у края укрытия, откуда игрока видно: стрелок высовывается и стреляет.
+  // Кандидаты — углы и середины стен дома, точки по кругу у валуна/ствола.
+  _pickPeek(u, p) {
+    const ob = u.cover && u.cover.ob;
+    if (!ob) return null;
+    const lim = this.world.size / 2 - 3;
+    let best = null;
+    let bestScore = Infinity;
+    const consider = (x, z, side) => {
+      if (Math.abs(x) > lim || Math.abs(z) > lim) return;
+      if (obstacleAt(this.covers, x, z, this.cfg.radius + 0.1)) return; // место занято другим препятствием
+      if (!this._los(x, z, p.x, p.z)) return; // оттуда игрока не видно
+      const dNpc = Math.hypot(x - u.pos.x, z - u.pos.z);
+      if (dNpc > 12) return;
+      const score = dNpc + (u.peekSide === side ? 0 : 2); // чаще выглядываем с той же стороны
+      if (score < bestScore) {
+        bestScore = score;
+        best = { x, z, side };
+      }
+    };
+    if (ob.rect) {
+      const ex = ob.e1 + 0.7;
+      const ez = ob.e2 + 0.7;
+      consider(ob.x + ex, ob.z + ez, 1);
+      consider(ob.x + ex, ob.z - ez, -1);
+      consider(ob.x - ex, ob.z + ez, -1);
+      consider(ob.x - ex, ob.z - ez, 1);
+      consider(ob.x + ex, ob.z, 1);
+      consider(ob.x - ex, ob.z, -1);
+      consider(ob.x, ob.z + ez, 1);
+      consider(ob.x, ob.z - ez, -1);
+    } else {
+      const r = ob.e1 + 0.7;
+      for (let k = 0; k < 8; k++) {
+        const a = (k / 8) * Math.PI * 2;
+        consider(ob.x + Math.cos(a) * r, ob.z + Math.sin(a) * r, k % 2 ? -1 : 1);
+      }
+    }
+    if (best) {
+      u.peekSide = best.side;
+      return { x: best.x, z: best.z };
+    }
+    return null;
+  }
+
+  // Случайная точка патруля вокруг центра: в городе, не в стенах, не за картой.
+  _pickPatrol(center) {
+    const city = this.covers.city;
+    const lim = this.world.size / 2 - 4;
+    for (let k = 0; k < 8; k++) {
+      const a = this.rng() * Math.PI * 2;
+      const r = 1.5 + this.rng() * this.cfg.patrolRadius;
+      let x = center.x + Math.cos(a) * r;
+      let z = center.z + Math.sin(a) * r;
+      if (city && center.x > city.minX && center.x < city.maxX && center.z > city.minZ && center.z < city.maxZ) {
+        x = Math.max(city.minX + 2, Math.min(city.maxX - 2, x)); // патруль держится города
+        z = Math.max(city.minZ + 2, Math.min(city.maxZ - 2, z));
+      }
+      x = Math.max(-lim, Math.min(lim, x));
+      z = Math.max(-lim, Math.min(lim, z));
+      if (obstacleAt(this.covers, x, z, 0.8) || this._blocked(x, z)) continue; // стены и баки
+      return { x, z };
+    }
+    return { x: center.x, z: center.z }; // зажаты стенами — стоим на месте
+  }
+
+  // Перенос NPC в instanced-меши: база (позиция + разворот + падение) для тела
+  // и головы, оружие — к кисти руки с анимацией замаха/отдачи.
+  _compose(i) {
+    const u = this.units[i];
+    this._q.setFromAxisAngle(UP, u.yaw);
+    if (u.fall > 0) {
+      this._qa.setFromAxisAngle(X_AXIS, -(Math.PI / 2) * u.fall);
+      this._q.multiply(this._qa); // заваливается вперёд, вокруг собственных ног
+    }
+    this._p.set(u.pos.x, u.pos.y, u.pos.z);
+    this._m.compose(this._p, this._q, ONE);
+    this.body.setMatrixAt(i, this._m);
+    this.head.setMatrixAt(i, this._m);
+
+    let ang;
+    if (u.weapon === 'pistol') {
+      ang = -0.1 - 0.5 * (u.gunT / 0.12); // отдача подкидывает ствол
+    } else {
+      const progress = u.swingT > 0 ? 1 - u.swingT / this.cfg.swingTime : 0;
+      ang = -0.25 + 1.3 * Math.sin(Math.PI * progress); // замах: палка описывает дугу
+    }
+    this._mHand.makeTranslation(HAND.x, HAND.y, HAND.z);
+    this._mRot.makeRotationX(ang);
+    this._mHand.multiply(this._mRot);
+    this._mPart.multiplyMatrices(this._m, this._mHand);
+    if (u.weapon === 'pistol') this.guns.setMatrixAt(u.wi, this._mPart);
+    else this.sticks.setMatrixAt(u.wi, this._mPart);
+  }
+
+  // Вернуть всех на исходные позиции в полном здравии (клавиша R).
+  resetAll() {
+    for (const u of this.units) {
+      u.pos.set(u.home.x, this.groundAt(u.home.x, u.home.z), u.home.z);
+      u.vel.set(0, 0, 0);
+      u.yaw = u.rot;
+      u.hp = this.fullHp;
+      u.dead = false;
+      u.fall = 0;
+      u.aware = false;
+      u.sees = false;
+      u.state = 'patrol';
+      u.lastKnown = null;
+      u.searchCenter = null;
+      u.cover = null;
+      u.coverFrom = { x: 0, z: 0 };
+      u.peek = null;
+      u.peekSide = 1;
+      u.hideT = 0;
+      u.target = null;
+      u.pauseT = 0;
+      u.thinkT = this.rng() * this.cfg.thinkInterval;
+      u.swingT = 0;
+      u.swingDone = true;
+      u.shotT = 0;
+      u.aimT = 0;
+      u.gunT = 0;
+      u.burstLeft = 0;
+    }
+    for (let i = 0; i < this.units.length; i++) this._compose(i);
+    for (const m of this.parts) m.instanceMatrix.needsUpdate = true;
+  }
+}
+
+// Собрать укрытия и стены в хеш-грид: дома (прямоугольники), крупные валуны и
+// стволы деревьев (круги). По гриду NPC проверяет видимость, ищет укрытие и
+// обходит препятствия. Чистая геометрия — гоняется headless-тестом.
+export function buildCovers(cfg, layout) {
+  const cell = 8;
+  const grid = new Map();
+  for (const b of layout.buildings) {
+    insertObstacle(grid, { rect: true, x: b.x, z: b.z, e1: b.w / 2, e2: b.d / 2 }, cell);
+  }
+  for (const r0 of layout.rocks) {
+    if (!r0.big) continue;
+    const r = Math.max(r0.sx, r0.sz) * 0.7;
+    insertObstacle(grid, { rect: false, x: r0.x, z: r0.z, e1: r, e2: r }, cell);
+  }
+  for (const t of layout.trees) {
+    const r = 0.3 * t.s; // крона высоко — взгляду мешает только ствол
+    insertObstacle(grid, { rect: false, x: t.x, z: t.z, e1: r, e2: r }, cell);
+  }
+  return { grid, cell, city: layout.city ? { ...layout.city } : null };
+}
+
+// Препятствие под точкой (с запасом pad) или null.
+function obstacleAt(covers, x, z, pad) {
+  const bucket = covers.grid.get(Math.floor(x / covers.cell) + ':' + Math.floor(z / covers.cell));
+  if (!bucket) return null;
+  for (const ob of bucket) {
+    const dx = Math.abs(x - ob.x);
+    const dz = Math.abs(z - ob.z);
+    if (ob.rect) {
+      if (dx < ob.e1 + pad && dz < ob.e2 + pad) return ob;
+    } else if (dx * dx + dz * dz < (ob.e1 + pad) * (ob.e1 + pad)) {
+      return ob;
+    }
+  }
+  return null;
+}
+
+// Обойти все препятствия в квадрате радиуса radius вокруг точки.
+function cellsAround(covers, x, z, radius, cb) {
+  const { cell, grid } = covers;
+  const gx0 = Math.floor((x - radius) / cell);
+  const gx1 = Math.floor((x + radius) / cell);
+  const gz0 = Math.floor((z - radius) / cell);
+  const gz1 = Math.floor((z + radius) / cell);
+  const seen = new Set();
+  for (let gx = gx0; gx <= gx1; gx++) {
+    for (let gz = gz0; gz <= gz1; gz++) {
+      const bucket = grid.get(gx + ':' + gz);
+      if (!bucket) continue;
+      for (const ob of bucket) {
+        if (seen.has(ob)) continue;
+        seen.add(ob);
+        cb(ob);
+      }
+    }
+  }
+}
+
+// Положить препятствие во все ячейки, которые накрывает его коробка.
+function insertObstacle(grid, ob, cell) {
+  const gx0 = Math.floor((ob.x - ob.e1) / cell);
+  const gx1 = Math.floor((ob.x + ob.e1) / cell);
+  const gz0 = Math.floor((ob.z - ob.e2) / cell);
+  const gz1 = Math.floor((ob.z + ob.e2) / cell);
+  for (let gx = gx0; gx <= gx1; gx++) {
+    for (let gz = gz0; gz <= gz1; gz++) {
+      const key = gx + ':' + gz;
+      let bucket = grid.get(key);
+      if (!bucket) {
+        bucket = [];
+        grid.set(key, bucket);
+      }
+      bucket.push(ob);
+    }
+  }
+}
+
+// Тело NPC: куртка + ноги, один слитый меш; происхождение — на уровне ног.
+function makeBodyGeometry() {
+  const torso = new THREE.BoxGeometry(0.52, 0.78, 0.3);
+  torso.translate(0, 1.11, 0);
+  const legL = new THREE.BoxGeometry(0.18, 0.72, 0.2);
+  legL.translate(-0.13, 0.36, 0);
+  const legR = legL.clone();
+  legR.translate(0.26, 0, 0);
+  return mergeGeometries([torso, legL, legR]);
+}
+
+function makeHeadGeometry() {
+  const head = new THREE.BoxGeometry(0.3, 0.3, 0.3);
+  head.translate(0, 1.66, 0);
+  return head;
+}
+
+// Палка: происхождение у кисти, растёт вверх.
+function makeStickGeometry() {
+  const g = new THREE.CylinderGeometry(0.035, 0.05, 1.05, 5);
+  g.translate(0, 0.5, 0);
+  return g;
+}
+
+// Пистолет: ствол вперёд и рукоятка вниз, происхождение — у кисти.
+function makeGunGeometry() {
+  const barrel = new THREE.BoxGeometry(0.07, 0.09, 0.32);
+  barrel.translate(0, 0.03, 0.13);
+  const grip = new THREE.BoxGeometry(0.06, 0.16, 0.09);
+  grip.translate(0, -0.09, 0.01);
+  return mergeGeometries([barrel, grip]);
+}

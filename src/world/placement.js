@@ -1,8 +1,8 @@
 import { createHeightmap } from './heightmap.js';
 import { mulberry32 } from '../core/noise.js';
 
-// Расстановка всего, что стоит на карте: город (дома, знаки, баки, мешки),
-// зелёная зона (лес, кусты, камни) и манекены у спавна.
+// Расстановка всего, что стоит на карте: город (дома, знаки, баки, мешки, NPC)
+// и зелёная зона (лес, кусты, камни).
 // Карта делится на две зоны: городскую прямоугольную и зелёную с буферной
 // полосой между ними. Чистая логика без three — гоняется headless-тестом.
 export function buildLayout(cfg) {
@@ -26,7 +26,7 @@ export function buildLayout(cfg) {
   const trees = [];
   const bushes = [];
   const rocks = [];
-  const dummies = [];
+  const npcs = [];
   const signs = [];
   const bins = [];
   const bags = [];
@@ -193,6 +193,27 @@ export function buildLayout(cfg) {
     bags.push(makeBag(x, z));
   }
 
+  // --- нпс: живут в городе — патрулируют вокруг своего угла, воюют с игроком
+  for (let i = 0; i < cfg.layout.npcs; i++) {
+    for (let attempt = 0; attempt < 60; attempt++) {
+      const x = cityRect.minX + 2.5 + rng() * (cityRect.maxX - cityRect.minX - 5);
+      const z = cityRect.minZ + 2.5 + rng() * (cityRect.maxZ - cityRect.minZ - 5);
+      if (overlapsAny(x, z, 2.6, 2.6, buildings)) continue;
+      if (bins.some((bn) => (bn.x - x) ** 2 + (bn.z - z) ** 2 < 1.5 ** 2)) continue;
+      if (bags.some((bg) => (bg.x - x) ** 2 + (bg.z - z) ** 2 < 1.1 ** 2)) continue;
+      if (signs.some((s) => (s.x - x) ** 2 + (s.z - z) ** 2 < 1.1 ** 2)) continue;
+      if (npcs.some((n) => (n.x - x) ** 2 + (n.z - z) ** 2 < 4 ** 2)) continue;
+      npcs.push({
+        x, z,
+        y: heightmap.heightAt(x, z) + liftAt(x, z),
+        rot: rng() * Math.PI * 2,
+        weapon: i % 5 < 3 ? 'pistol' : 'stick', // две трети с пистолетами
+        home: { x, z },
+      });
+      break;
+    }
+  }
+
   // --- деревья: только зелёная зона; сетка минимальной дистанции через хеш-грид
   const GRID = 4;
   const treeGrid = new Map();
@@ -220,19 +241,6 @@ export function buildLayout(cfg) {
     gridPush(treeGrid, x, z, tree, GRID);
   }
 
-  // --- манекены: кольцо вокруг точки спавна (зелёная зона)
-  for (let i = 0; i < cfg.layout.dummies; i++) {
-    for (let attempt = 0; attempt < 30; attempt++) {
-      const ang = (i / cfg.layout.dummies) * Math.PI * 2 + rng() * 0.8;
-      const dist = 7 + rng() * 5;
-      const x = Math.cos(ang) * dist;
-      const z = Math.sin(ang) * dist;
-      if (overlapsAny(x, z, 2.5, 2.5, buildings)) continue;
-      dummies.push({ x, z, y: heightmap.heightAt(x, z), rot: ang + Math.PI });
-      break;
-    }
-  }
-
   // --- кусты: зелёная зона; растут подлеском у деревьев, одиночки — редкость
   const bushTarget = cfg.layout.bushes;
   const BGRID = 3;
@@ -248,7 +256,6 @@ export function buildLayout(cfg) {
     if (overlapsAny(x, z, 3, 3, buildings)) continue;
     if (nearAny(treeGrid, x, z, 2.0, GRID)) continue;   // не в стволах
     if (nearAny(bushGrid, x, z, 2.2, BGRID)) continue;  // куст к кусту не вплотную
-    if (dummies.some((dd) => (dd.x - x) ** 2 + (dd.z - z) ** 2 < 2.5 ** 2)) continue;
     // подлесок: без дерева поблизости куст прорастает лишь в четверти случаев
     if (rng() > 0.25 && !nearAny(treeGrid, x, z, 9, GRID, 3)) continue;
 
@@ -285,7 +292,6 @@ export function buildLayout(cfg) {
       if (overlapsAny(x, z, 3, 3, buildings)) continue;
       if (nearAny(rockGrid, x, z, big ? 3.2 : 1.4, RGRID)) continue;
       if (big && nearAny(treeGrid, x, z, 2.2, GRID)) continue;  // валуны не растут из стволов
-      if (dummies.some((dd) => (dd.x - x) ** 2 + (dd.z - z) ** 2 < 3 ** 2)) continue;
 
       const s = sMin + rng() * (sMax - sMin);
       const rock = {
@@ -311,7 +317,7 @@ export function buildLayout(cfg) {
 
   return {
     heightmap, city: cityRect,
-    buildings, trees, bushes, rocks, dummies, signs, bins, bags,
+    buildings, trees, bushes, rocks, npcs, signs, bins, bags,
     spawn: { x: 0, z: 0 },
   };
 }
@@ -332,7 +338,7 @@ export function makeCityLift(cfg, buildings) {
   };
 }
 
-// AABB-коллайдеры крупных валунов: игрок и манекены не проходят сквозь них.
+// AABB-коллайдеры крупных валунов: игрок и NPC не проходят сквозь них.
 export function rockColliders(rocks) {
   const out = [];
   for (const rock of rocks) {

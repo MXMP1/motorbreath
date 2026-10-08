@@ -31,6 +31,15 @@
       pointer-events: none;
     }
 
+    /* Красный фильтр полученного урона: плотность задаёт main.js по остатку здоровья */
+    #damage {
+      position: fixed; inset: 0;
+      opacity: 0;
+      background: radial-gradient(ellipse at center,
+        rgba(205, 28, 28, 0.35) 0%, rgba(150, 8, 8, 0.85) 100%);
+      pointer-events: none;
+    }
+
     #hint {
       position: fixed; inset: 0;
       display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
@@ -47,6 +56,7 @@
 </head>
 <body>
   <canvas id="game"></canvas>
+  <div id="damage"></div>
   <div id="crosshair"></div>
   <pre id="hud"></pre>
   <div id="hint">
@@ -54,7 +64,7 @@
     <div>Клик — захватить мышь и начать</div>
     <div class="muted">WASD — движение · Shift — бег · C — присед · Пробел — прыжок</div>
     <div class="muted">ЛКМ — применить предмет · 1/2 — палка/пистолет · колесо — следующее</div>
-    <div class="muted">V — разрешение · F3 — HUD · R — сброс манекенов · G — новый мир</div>
+    <div class="muted">V — разрешение · F3 — HUD · R — сброс NPC и предметов · G — новый мир</div>
   </div>
   <script type="module" src="/src/main.js"></script>
 </body>

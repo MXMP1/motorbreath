@@ -19,6 +19,9 @@ export class Player {
     this.eye = cfg.player.eyeHeight;
     this.hSpeed = 0;
     this.state = 'стоя';
+    this.maxHp = cfg.player.maxHp;
+    this.hp = this.maxHp;
+    this.regenDelay = 0;
 
     this._fwd = new THREE.Vector3();
     this._right = new THREE.Vector3();
@@ -38,7 +41,17 @@ export class Player {
     this.onGround = true;
     this.crouching = false;
     this.eye = this.cfg.eyeHeight;
+    this.hp = this.maxHp; // новый мир или смерть — здоровье полное
+    this.regenDelay = 0;
     this.syncCamera();
+  }
+
+  // Урон от NPC: пауза регена; на нуле — респавн на спавне с полным здоровьем.
+  damage(amount) {
+    if (amount <= 0) return;
+    this.hp -= amount;
+    this.regenDelay = this.cfg.regenDelay;
+    if (this.hp <= 0) this.respawn();
   }
 
   setWorld(world) {
@@ -145,6 +158,10 @@ export class Player {
     const targetEye = this.crouching ? c.crouchEyeHeight : c.eyeHeight;
     this.eye += (targetEye - this.eye) * Math.min(1, dt * 10);
 
+    // ---- здоровье: медленно восстанавливается после паузы без урона
+    if (this.regenDelay > 0) this.regenDelay = Math.max(0, this.regenDelay - dt);
+    else if (this.hp < this.maxHp) this.hp = Math.min(this.maxHp, this.hp + c.regen * dt);
+
     this.hSpeed = Math.hypot(this.vel.x, this.vel.z);
     this.state = !this.onGround ? 'воздух'
       : this.crouching ? 'присед'
@@ -159,4 +176,22 @@ function approach(v, target, maxDelta) {
   const d = target - v;
   if (Math.abs(d) <= maxDelta) return target;
   return v + Math.sign(d) * maxDelta;
+}
+
+// Качение камеры от попадания: сторона удара задаёт знаки рывков.
+// Игрок получает удар «оттуда» — камера уходит в противоположную сторону:
+// сзади — кивок вниз, спереди — вверх, справа/слева — рывок и крен.
+// Чистая функция — гоняется headless-тестом.
+export function hurtKick(fromX, fromZ, px, pz, fwdX, fwdZ, hurt) {
+  const dx = fromX - px;
+  const dz = fromZ - pz;
+  const d = Math.hypot(dx, dz) || 1;
+  const nx = dx / d;
+  const nz = dz / d;
+  const len = Math.hypot(fwdX, fwdZ) || 1;
+  const fx = fwdX / len;
+  const fz = fwdZ / len;
+  const side = nx * -fz + nz * fx; // плюс — удар пришёл справа от взгляда
+  const front = nx * fx + nz * fz; // плюс — удар пришёл спереди
+  return { yaw: side * hurt.yaw, pitch: front * hurt.pitch, roll: side * hurt.roll };
 }
